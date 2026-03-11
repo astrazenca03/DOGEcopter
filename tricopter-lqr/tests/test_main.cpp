@@ -72,7 +72,6 @@ void test_balloc_torque_values() {
 
     // Rotor 0 (front): pos=[0.25,0,0], force=[0,0,k_T], spin_dir=+1, k_Q=2.5e-7
     // torque = cross([0.25,0,0], [0,0,1.5e-5]) + 1*2.5e-7*[0,0,1]
-    //        = [0*1.5e-5 - 0*0, 0*0 - 0.25*1.5e-5, 0.25*0 - 0*0] + [0,0,2.5e-7]
     //        = [0, -3.75e-6, 0] + [0, 0, 2.5e-7]
     //        = [0, -3.75e-6, 2.5e-7]
     ASSERT_NEAR(alloc.B_tau(0, 0), 0.0, 1e-12);
@@ -81,7 +80,6 @@ void test_balloc_torque_values() {
 
     // Rotor 1 (rear-left): pos=[-0.15,0.20,0], spin_dir=-1
     // torque = cross([-0.15,0.20,0], [0,0,1.5e-5]) + (-1)*2.5e-7*[0,0,1]
-    //        = [0.20*1.5e-5, -(-0.15)*1.5e-5, 0] + [0,0,-2.5e-7]
     //        = [3.0e-6, 2.25e-6, -2.5e-7]
     ASSERT_NEAR(alloc.B_tau(0, 1), 0.20 * 1.5e-5, 1e-12);
     ASSERT_NEAR(alloc.B_tau(1, 1), 0.15 * 1.5e-5, 1e-12);
@@ -97,7 +95,6 @@ void test_trim_residual_torque() {
     ASSERT_TRUE(trim.solve(cfg, alloc));
 
     // Residual torque is non-zero for this servoless tricopter geometry
-    // (3 actuators, 4 constraints). The KKT solver minimises ||B_tau*u||.
     Eigen::Vector3d residual = alloc.B_tau * trim.u_hover;
     std::cout << "    Trim residual torque norm: " << residual.norm() << "\n";
     ASSERT_TRUE(std::isfinite(residual.norm()));
@@ -116,21 +113,21 @@ void test_trim_thrust_balance() {
     ASSERT_NEAR(trim.total_thrust_hover, mg, 0.01);
 }
 
-// ===== Test: CARE solver =====
+// ===== Test: CARE solver (4-state roll/pitch LQR) =====
 void test_care_p_symmetric_positive_definite() {
     Config cfg = getTestConfig();
     ControlAllocation alloc;
     alloc.build(cfg);
-    AttitudeLQR lqr;
+    RollPitchLQR lqr;
     ASSERT_TRUE(lqr.build(cfg, alloc));
 
     // P should be symmetric
     double sym_err = (lqr.P - lqr.P.transpose()).norm();
     ASSERT_TRUE(sym_err < 1e-8);
 
-    // P should be positive definite (all eigenvalues > 0)
-    Eigen::SelfAdjointEigenSolver<Eigen::Matrix<double, 6, 6>> es(lqr.P);
-    for (int i = 0; i < 6; ++i) {
+    // P should be positive definite (all 4 eigenvalues > 0)
+    Eigen::SelfAdjointEigenSolver<Eigen::Matrix4d> es(lqr.P);
+    for (int i = 0; i < 4; ++i) {
         ASSERT_TRUE(es.eigenvalues()(i) > 0);
     }
 }
@@ -139,15 +136,54 @@ void test_care_closed_loop_stable() {
     Config cfg = getTestConfig();
     ControlAllocation alloc;
     alloc.build(cfg);
-    AttitudeLQR lqr;
+    RollPitchLQR lqr;
     ASSERT_TRUE(lqr.build(cfg, alloc));
 
-    // All closed-loop eigenvalues must have negative real part
-    Eigen::Matrix<double, 6, 6> A_cl = lqr.A_att - lqr.B_att * lqr.K;
-    Eigen::EigenSolver<Eigen::Matrix<double, 6, 6>> es(A_cl);
-    for (int i = 0; i < 6; ++i) {
+    // All 4 closed-loop eigenvalues must have negative real part
+    Eigen::Matrix4d A_cl = lqr.A_rp - lqr.B_rp * lqr.K;
+    Eigen::EigenSolver<Eigen::Matrix4d> es(A_cl);
+    for (int i = 0; i < 4; ++i) {
         ASSERT_TRUE(es.eigenvalues()(i).real() < 0);
     }
+}
+
+// ===== Test: Yaw damper =====
+void test_yaw_damper() {
+    Config cfg = getTestConfig();
+    ControlAllocation alloc;
+    alloc.build(cfg);
+    YawDamper yd;
+    yd.build(cfg, alloc);
+
+    // With zero yaw rate, output should be zero
+    Eigen::Vector3d du_zero = yd.compute(0.0);
+    ASSERT_NEAR(du_zero.norm(), 0.0, 1e-15);
+
+    // With positive yaw rate, should produce negative yaw torque
+    // (damping opposes motion)
+    Eigen::Vector3d du_pos = yd.compute(1.0);
+    // Verify the yaw torque produced is negative: B_tau_yaw * du should be < 0
+    Eigen::RowVector3d yaw_row = alloc.B_tau.row(2);
+    double tau_yaw = yaw_row * du_pos;
+    ASSERT_TRUE(tau_yaw < 0);  // damping opposes positive yaw rate
+}
+
+// ===== Test: Heading-aware command =====
+void test_heading_aware_command() {
+    // At zero heading, should be identity mapping
+    Eigen::Vector2d cmd0 = HeadingAwareCommand::computeAttitudeCmd(1.0, 0.0, 0.0);
+    ASSERT_NEAR(cmd0(0),  1.0 / 9.81, 1e-6);  // phi_cmd = ax/g
+    ASSERT_NEAR(cmd0(1),  0.0, 1e-6);          // theta_cmd = 0
+
+    // At 90 degrees heading, axes rotate
+    Eigen::Vector2d cmd90 = HeadingAwareCommand::computeAttitudeCmd(1.0, 0.0, M_PI / 2.0);
+    ASSERT_NEAR(cmd90(0), 0.0, 1e-6);          // phi_cmd ≈ 0
+    ASSERT_NEAR(cmd90(1), -1.0 / 9.81, 1e-6);  // theta_cmd = -ax/g
+
+    // Zero desired acceleration should give zero command regardless of heading
+    Eigen::Vector2d cmd_hover = HeadingAwareCommand::computeAttitudeCmd(0.0, 0.0, 1.23);
+    ASSERT_NEAR(cmd_hover(0), 0.0, 1e-15);
+    ASSERT_NEAR(cmd_hover(1), 0.0, 1e-15);
 }
 
 // ===== Test: Quaternion normalisation through RK4 =====
@@ -213,6 +249,8 @@ int main() {
     TEST(trim_thrust_balance);
     TEST(care_p_symmetric_positive_definite);
     TEST(care_closed_loop_stable);
+    TEST(yaw_damper);
+    TEST(heading_aware_command);
     TEST(quaternion_normalisation);
     TEST(pid_step_response);
 

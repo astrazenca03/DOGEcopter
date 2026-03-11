@@ -11,7 +11,8 @@ void Simulation::run(
     const Config& cfg,
     const ControlAllocation& /* alloc */,
     const TrimSolver& trim,
-    const AttitudeLQR& lqr,
+    const RollPitchLQR& lqr,
+    const YawDamper& yaw_damper,
     const std::string& output_path)
 {
     const int N = static_cast<int>(cfg.rotors.size());
@@ -43,7 +44,9 @@ void Simulation::run(
     std::cout << "Duration: " << cfg.sim.duration << " s, dt: " << dt << " s\n";
     std::cout << "Initial perturbation: roll=" << cfg.sim.initial_roll_deg
               << " deg, pitch=" << cfg.sim.initial_pitch_deg
-              << " deg, yaw=" << cfg.sim.initial_yaw_deg << " deg\n\n";
+              << " deg, yaw=" << cfg.sim.initial_yaw_deg << " deg\n";
+    std::cout << "Controller: Roll/Pitch LQR (4-state) + Yaw Damper (k_r="
+              << yaw_damper.k_r << ") + Altitude PID\n\n";
 
     for (int step = 0; step <= num_steps; ++step) {
         double t = step * dt;
@@ -52,20 +55,32 @@ void Simulation::run(
         Eigen::Vector3d euler = dynamics::quaternionToEulerZYX(x);
         Eigen::Vector3d omega_body = x.segment<3>(10);
 
-        // --- Attitude error ---
-        // Wrap yaw error to [-pi, pi] for large-angle robustness
-        double psi_err = euler(2);
-        while (psi_err > M_PI)  psi_err -= 2.0 * M_PI;
-        while (psi_err < -M_PI) psi_err += 2.0 * M_PI;
+        double phi   = euler(0);
+        double theta = euler(1);
+        double psi   = euler(2);
+        double p = omega_body(0);
+        double q = omega_body(1);
+        double r = omega_body(2);
 
-        Eigen::Matrix<double, 6, 1> delta_x_att;
-        delta_x_att(0) = euler(0);   // phi error
-        delta_x_att(1) = euler(1);   // theta error
-        delta_x_att(2) = psi_err;    // psi error (wrapped)
-        delta_x_att.tail<3>() = omega_body;
+        // --- Heading-aware attitude command ---
+        // For level hover: ax_desired = 0, ay_desired = 0
+        Eigen::Vector2d att_cmd = HeadingAwareCommand::computeAttitudeCmd(
+            0.0, 0.0, psi);
+        double phi_cmd   = att_cmd(0);
+        double theta_cmd = att_cmd(1);
 
-        // --- Inner loop: attitude LQR ---
-        Eigen::Vector3d delta_u_att = lqr.compute(delta_x_att);
+        // --- Roll/pitch error (4-state) ---
+        Eigen::Vector4d delta_x_rp;
+        delta_x_rp(0) = phi   - phi_cmd;
+        delta_x_rp(1) = theta - theta_cmd;
+        delta_x_rp(2) = p;  // desired rate = 0
+        delta_x_rp(3) = q;  // desired rate = 0
+
+        // --- Inner loop: roll/pitch LQR ---
+        Eigen::Vector3d delta_u_rp = lqr.compute(delta_x_rp);
+
+        // --- Yaw rate damper ---
+        Eigen::Vector3d delta_u_yaw = yaw_damper.compute(r);
 
         // --- Outer loop: altitude PID ---
         double z_current = x(2);
@@ -77,10 +92,10 @@ void Simulation::run(
         double delta_u_coll = (T_cmd - trim.total_thrust_hover) / (N * k_T_avg);
 
         // --- Combined control law ---
-        // u = u_hover + delta_u_att + delta_u_coll * [1,1,...,1]
+        // u = u_hover + delta_u_rollpitch + delta_u_yaw + delta_u_coll * [1,...,1]
         Eigen::VectorXd u(N);
         for (int i = 0; i < N; ++i) {
-            u(i) = trim.u_hover(i) + delta_u_att(i) + delta_u_coll;
+            u(i) = trim.u_hover(i) + delta_u_rp(i) + delta_u_yaw(i) + delta_u_coll;
             u(i) = std::clamp(u(i), 0.0, omega_max_sq);
         }
 
@@ -90,9 +105,9 @@ void Simulation::run(
             T_total += cfg.rotors[i].k_T * u(i);
 
         // --- Log to CSV ---
-        double phi_deg   = euler(0) * 180.0 / M_PI;
-        double theta_deg = euler(1) * 180.0 / M_PI;
-        double psi_deg   = euler(2) * 180.0 / M_PI;
+        double phi_deg   = phi   * 180.0 / M_PI;
+        double theta_deg = theta * 180.0 / M_PI;
+        double psi_deg   = psi   * 180.0 / M_PI;
 
         csv << std::fixed << std::setprecision(6)
             << t << ","
@@ -112,7 +127,8 @@ void Simulation::run(
                       << "  phi=" << std::setw(8) << std::setprecision(3) << phi_deg
                       << "  theta=" << std::setw(8) << theta_deg
                       << "  psi=" << std::setw(8) << psi_deg
-                      << "  z=" << std::setw(8) << std::setprecision(4) << x(2)
+                      << "  r=" << std::setw(8) << std::setprecision(4) << r
+                      << "  z=" << std::setw(8) << x(2)
                       << "  T=" << std::setw(8) << std::setprecision(3) << T_total
                       << "\n";
         }

@@ -3,26 +3,31 @@
 #include <Eigen/Eigenvalues>
 #include <cmath>
 
-bool AttitudeLQR::build(const Config& cfg, const ControlAllocation& alloc) {
-    // --- Build A_att (6x6) ---
-    // At hover (omega_0 = 0):
-    //   A = [0_{3x3}  I_{3x3}]
-    //       [0_{3x3}  0_{3x3}]
-    A_att.setZero();
-    A_att.block<3,3>(0, 3) = Eigen::Matrix3d::Identity();
+// ============================================================================
+// RollPitchLQR
+// ============================================================================
 
-    // --- Build B_att (6x3) ---
-    // B = [0_{3x3}        ]
-    //     [J_inv * B_tau   ]
+bool RollPitchLQR::build(const Config& cfg, const ControlAllocation& alloc) {
+    // --- Build A_rp (4x4) ---
+    // At hover (omega_0 = 0):
+    //   A = [0_{2x2}  I_{2x2}]
+    //       [0_{2x2}  0_{2x2}]
+    A_rp.setZero();
+    A_rp.block<2,2>(0, 2) = Eigen::Matrix2d::Identity();
+
+    // --- Build B_rp (4x3) ---
+    // B = [0_{2x3}                          ]
+    //     [first 2 rows of J_inv * B_tau    ]
     Eigen::Matrix3d J_inv = cfg.J.inverse();
     Eigen::Matrix3d B_tau_3x3 = alloc.B_tau;  // (3x3)
+    Eigen::Matrix3d JinvBtau = J_inv * B_tau_3x3;
 
-    B_att.setZero();
-    B_att.block<3,3>(3, 0) = J_inv * B_tau_3x3;
+    B_rp.setZero();
+    B_rp.block<2,3>(2, 0) = JinvBtau.topRows<2>();  // rows 0,1 of J_inv*B_tau
 
-    // --- Build Q (6x6) diagonal ---
+    // --- Build Q (4x4) diagonal ---
     Q.setZero();
-    for (int i = 0; i < 6; ++i)
+    for (int i = 0; i < 4; ++i)
         Q(i, i) = cfg.att_lqr.Q_diag(i);
 
     // --- Build R (3x3) diagonal ---
@@ -30,29 +35,30 @@ bool AttitudeLQR::build(const Config& cfg, const ControlAllocation& alloc) {
     for (int i = 0; i < 3; ++i)
         R(i, i) = cfg.att_lqr.R_diag(i);
 
-    std::cout << "\n=== Attitude LQR Setup ===\n";
-    std::cout << "A_att (6x6):\n" << A_att << "\n\n";
-    std::cout << "B_att (6x3):\n" << B_att << "\n\n";
+    std::cout << "\n=== Roll/Pitch LQR Setup (4-state) ===\n";
+    std::cout << "A_rp (4x4):\n" << A_rp << "\n\n";
+    std::cout << "B_rp (4x3):\n" << B_rp << "\n\n";
     std::cout << "J_inv:\n" << J_inv << "\n\n";
-    std::cout << "J_inv * B_tau:\n" << J_inv * B_tau_3x3 << "\n\n";
+    std::cout << "J_inv * B_tau (full 3x3):\n" << JinvBtau << "\n";
+    std::cout << "  (using rows 0-1 for roll/pitch)\n\n";
 
-    // --- Solve CARE via Hamiltonian eigenvalue decomposition ---
+    // --- Solve CARE ---
     bool converged = solveCARE();
     if (!converged) {
         std::cerr << "*** CARE solver failed! ***\n";
         return false;
     }
 
-    // Compute gain: K = R_inv * B^T * P  (3x6)
-    K = R.inverse() * B_att.transpose() * P;
+    // Compute gain: K = R_inv * B^T * P  (3x4)
+    K = R.inverse() * B_rp.transpose() * P;
 
     printDiagnostics();
 
     // Check all closed-loop eigenvalues have negative real part
-    Eigen::Matrix<double, 6, 6> A_cl = A_att - B_att * K;
-    Eigen::EigenSolver<Eigen::Matrix<double, 6, 6>> es(A_cl);
+    Eigen::Matrix4d A_cl = A_rp - B_rp * K;
+    Eigen::EigenSolver<Eigen::Matrix4d> es(A_cl);
     bool stable = true;
-    for (int i = 0; i < 6; ++i) {
+    for (int i = 0; i < 4; ++i) {
         if (es.eigenvalues()(i).real() >= 0) {
             stable = false;
             break;
@@ -61,18 +67,18 @@ bool AttitudeLQR::build(const Config& cfg, const ControlAllocation& alloc) {
     return stable;
 }
 
-Eigen::Vector3d AttitudeLQR::compute(const Eigen::Matrix<double, 6, 1>& delta_x) const {
+Eigen::Vector3d RollPitchLQR::compute(const Eigen::Vector4d& delta_x) const {
     return -K * delta_x;
 }
 
-void AttitudeLQR::printDiagnostics() const {
-    std::cout << "\n=== LQR Diagnostics ===\n";
-    std::cout << "Gain matrix K_att (3x6):\n" << K << "\n\n";
+void RollPitchLQR::printDiagnostics() const {
+    std::cout << "\n=== Roll/Pitch LQR Diagnostics ===\n";
+    std::cout << "Gain matrix K_rp (3x4):\n" << K << "\n\n";
 
-    Eigen::Matrix<double, 6, 6> A_cl = A_att - B_att * K;
-    Eigen::EigenSolver<Eigen::Matrix<double, 6, 6>> es(A_cl);
-    std::cout << "Closed-loop eigenvalues of (A - B*K):\n";
-    for (int i = 0; i < 6; ++i) {
+    Eigen::Matrix4d A_cl = A_rp - B_rp * K;
+    Eigen::EigenSolver<Eigen::Matrix4d> es(A_cl);
+    std::cout << "Closed-loop eigenvalues of (A_rp - B_rp*K):\n";
+    for (int i = 0; i < 4; ++i) {
         auto ev = es.eigenvalues()(i);
         std::cout << "  lambda_" << i << " = " << ev.real();
         if (std::abs(ev.imag()) > 1e-10)
@@ -80,42 +86,31 @@ void AttitudeLQR::printDiagnostics() const {
         std::cout << "  (stable: " << (ev.real() < 0 ? "YES" : "NO") << ")\n";
     }
 
-    Eigen::SelfAdjointEigenSolver<Eigen::Matrix<double, 6, 6>> pev(P);
+    Eigen::SelfAdjointEigenSolver<Eigen::Matrix4d> pev(P);
     std::cout << "\nP eigenvalues (should all be positive): "
               << pev.eigenvalues().transpose() << "\n";
-    std::cout << "======================\n\n";
+    std::cout << "==================================\n\n";
 }
 
-bool AttitudeLQR::solveCARE() {
+bool RollPitchLQR::solveCARE() {
     // Solve CARE: A^T P + P A - P B R^{-1} B^T P + Q = 0
     //
     // Method: Matrix Sign Function applied to the Hamiltonian.
     //
-    // The Hamiltonian H has eigenvalues symmetric about the imaginary axis.
-    // sign(H) separates the stable/unstable invariant subspaces.
-    //
     //   H = [ A,    -S   ]    where S = B R^{-1} B^T
     //       [-Q,    -A^T ]
-    //
-    // After convergence of sign iteration: sign(H) → W
-    //   W = [W11, W12; W21, W22]
-    //   P = (W21 - I) * inv(W11 + I)  ... but more robustly:
-    //   From the stable subspace: [I; P] spans the columns of 0.5*(I - W)
-    //
-    // The sign function iteration: Z_{k+1} = 0.5*(Z_k + Z_k^{-1})
-    // With determinant scaling for faster convergence.
 
-    const int n = 6;
-    const int n2 = 2 * n;  // 12
+    const int n = 4;
+    const int n2 = 2 * n;  // 8
     Eigen::Matrix3d R_inv = R.inverse();
-    Eigen::Matrix<double, 6, 6> S = B_att * R_inv * B_att.transpose();
+    Eigen::Matrix4d S = B_rp * R_inv * B_rp.transpose();
 
-    // Build Hamiltonian (12x12)
+    // Build Hamiltonian (8x8)
     Eigen::MatrixXd Z(n2, n2);
-    Z.block<6,6>(0, 0) =  A_att;
-    Z.block<6,6>(0, 6) = -S;
-    Z.block<6,6>(6, 0) = -Q;
-    Z.block<6,6>(6, 6) = -A_att.transpose();
+    Z.block<4,4>(0, 0) =  A_rp;
+    Z.block<4,4>(0, 4) = -S;
+    Z.block<4,4>(4, 0) = -Q;
+    Z.block<4,4>(4, 4) = -A_rp.transpose();
 
     // Matrix sign function iteration with determinant scaling
     const int max_iter = 200;
@@ -129,7 +124,6 @@ bool AttitudeLQR::solveCARE() {
         double gamma = 1.0;
         if (det_abs > 1e-300 && std::isfinite(det_abs)) {
             gamma = std::pow(det_abs, -1.0 / n2);
-            // Clamp gamma to avoid extreme scaling
             gamma = std::clamp(gamma, 0.1, 10.0);
         }
 
@@ -150,29 +144,17 @@ bool AttitudeLQR::solveCARE() {
     }
 
     // Extract P from the sign matrix W = sign(H).
-    // The stable invariant subspace is spanned by columns of 0.5*(I - W).
-    // Partition W = [W11 W12; W21 W22], each 6x6.
-    //
-    // P = -W21 * (W11 - I)^{-1}  =  (W22 - I)^{-1} * (-W12)
-    // More robust: use the relation W21 = -P*(W11+I)/2 ...
-    //
-    // Standard result: P = (I_n - W22)^{-1} * W21
-    // Or equivalently: P = W21 * (I_n - W11)^{-1}   (both should give same result)
-
-    Eigen::MatrixXd W11 = Z.block<6,6>(0, 0);
-    Eigen::MatrixXd W21 = Z.block<6,6>(6, 0);
+    Eigen::MatrixXd W11 = Z.block<4,4>(0, 0);
+    Eigen::MatrixXd W21 = Z.block<4,4>(4, 0);
     Eigen::MatrixXd I_n = Eigen::MatrixXd::Identity(n, n);
 
-    // Stable projection: Π = (I - W)/2, column space = {[v; Pv]}
-    // Π_21 = -W21/2, Π_11 = (I - W11)/2
-    // P = Π_21 * Π_11^{-1} = -W21 * (I - W11)^{-1}
     Eigen::MatrixXd P_raw = -W21 * (I_n - W11).inverse();
 
     // Symmetrise
     P = 0.5 * (P_raw + P_raw.transpose());
 
     // Verify P is positive definite
-    Eigen::SelfAdjointEigenSolver<Eigen::Matrix<double, 6, 6>> pev(P);
+    Eigen::SelfAdjointEigenSolver<Eigen::Matrix4d> pev(P);
     double min_eig = pev.eigenvalues().minCoeff();
     if (min_eig < -1e-6) {
         std::cerr << "[CARE] P is not positive definite (min eigenvalue = "
@@ -181,18 +163,73 @@ bool AttitudeLQR::solveCARE() {
     }
 
     // Verify CARE residual: A^T P + P A - P S P + Q ≈ 0
-    Eigen::Matrix<double, 6, 6> residual =
-        A_att.transpose() * P + P * A_att - P * S * P + Q;
+    Eigen::Matrix4d residual =
+        A_rp.transpose() * P + P * A_rp - P * S * P + Q;
     double res_norm = residual.norm();
     std::cout << "[CARE] Residual norm: " << res_norm << "\n";
 
     return res_norm < 1e-4;
 }
 
-Eigen::MatrixXd AttitudeLQR::solveLyapunov(
-    const Eigen::MatrixXd& /* A_cl */,
-    const Eigen::MatrixXd& /* Q_lyap */) const
+// ============================================================================
+// YawDamper
+// ============================================================================
+
+void YawDamper::build(const Config& cfg, const ControlAllocation& alloc) {
+    k_r = cfg.yaw_damper.k_r;
+
+    // The yaw row of B_tau is row 2 (z-axis torque).
+    // We want to find delta_u such that B_tau_yaw * delta_u = tau_yaw_cmd
+    // while minimising ||delta_u|| and minimising disturbance to roll/pitch.
+    //
+    // Full pseudoinverse of B_tau gives us the minimum-norm solution that
+    // also distributes yaw torque with minimal roll/pitch coupling.
+    // We extract the yaw (row 2) contribution.
+
+    Eigen::Matrix3d B_tau_3x3 = alloc.B_tau;  // (3x3)
+
+    // Pseudoinverse of B_tau: B_tau^+ = B_tau^T (B_tau B_tau^T)^{-1}
+    Eigen::Matrix3d BtauBtauT = B_tau_3x3 * B_tau_3x3.transpose();
+    Eigen::Matrix3d BtauBtauT_inv = BtauBtauT.inverse();
+    Eigen::Matrix3d B_tau_pinv = B_tau_3x3.transpose() * BtauBtauT_inv;
+
+    // Column 2 of the pseudoinverse maps yaw torque to motor commands
+    yaw_pinv = B_tau_pinv.col(2);
+
+    std::cout << "\n=== Yaw Damper Setup ===\n";
+    std::cout << "k_r: " << k_r << "\n";
+    std::cout << "Yaw row of B_tau: " << B_tau_3x3.row(2) << "\n";
+    std::cout << "Pseudoinverse yaw column: " << yaw_pinv.transpose() << "\n";
+    std::cout << "========================\n\n";
+}
+
+Eigen::Vector3d YawDamper::compute(double r) const {
+    // Desired yaw torque: tau_yaw_cmd = -k_r * r
+    double tau_yaw_cmd = -k_r * r;
+    // Convert to motor commands via pseudoinverse
+    return yaw_pinv * tau_yaw_cmd;
+}
+
+void YawDamper::printDiagnostics() const {
+    std::cout << "\n=== Yaw Damper Diagnostics ===\n";
+    std::cout << "k_r = " << k_r << "\n";
+    std::cout << "yaw_pinv = " << yaw_pinv.transpose() << "\n";
+    std::cout << "==============================\n\n";
+}
+
+// ============================================================================
+// HeadingAwareCommand
+// ============================================================================
+
+Eigen::Vector2d HeadingAwareCommand::computeAttitudeCmd(
+    double ax_desired, double ay_desired, double psi)
 {
-    // Kept for interface compatibility — no longer used
-    return Eigen::MatrixXd::Zero(6, 6);
+    const double g = 9.81;
+    double cpsi = std::cos(psi);
+    double spsi = std::sin(psi);
+
+    double phi_cmd   = ( cpsi * ax_desired + spsi * ay_desired) / g;
+    double theta_cmd = (-spsi * ax_desired + cpsi * ay_desired) / g;
+
+    return Eigen::Vector2d(phi_cmd, theta_cmd);
 }

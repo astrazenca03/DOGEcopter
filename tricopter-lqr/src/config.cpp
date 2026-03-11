@@ -42,14 +42,18 @@ Config loadConfig(const std::string& filepath) {
         cfg.rotors.push_back(rc);
     }
 
-    // --- Attitude LQR ---
+    // --- Attitude LQR (4-state: phi, theta, p, q) ---
     auto lqr = root["attitude_lqr"];
     auto qd = lqr["Q_diag"];
-    for (int i = 0; i < 6; ++i)
+    for (int i = 0; i < 4; ++i)
         cfg.att_lqr.Q_diag(i) = qd[i].as<double>();
     auto rd = lqr["R_diag"];
     for (int i = 0; i < 3; ++i)
         cfg.att_lqr.R_diag(i) = rd[i].as<double>();
+
+    // --- Yaw Damper ---
+    auto yd = root["yaw_damper"];
+    cfg.yaw_damper.k_r = yd["k_r"].as<double>();
 
     // --- Altitude PID ---
     auto pid = root["altitude_pid"];
