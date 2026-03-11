@@ -40,17 +40,21 @@ rotors:
     k_T: 1.5e-5
     k_Q: 2.5e-7
 
-# Inner-loop attitude LQR weights
+# Inner-loop roll/pitch LQR weights (4-state system)
+# Yaw is handled separately by the yaw rate damper.
 attitude_lqr:
-  # Q diagonal: [q_phi, q_theta, q_psi, q_p, q_q, q_r]
-  # Note: control input is omega^2 (~3e5 at hover), so R must be tiny
-  # relative to Q to get aggressive enough control.
-  Q_diag: [500.0, 500.0, 200.0, 50.0, 50.0, 20.0]
+  # Q diagonal: [q_phi, q_theta, q_p, q_q]
+  # Only roll/pitch angles and rates — no yaw.
+  Q_diag: [100.0, 100.0, 10.0, 10.0]
   # R diagonal: [r1, r2, r3]
-  # R penalises delta_omega^2. Since omega^2 ~ 3e5 at hover, R must be
-  # small enough for aggressive attitude correction but large enough to
-  # avoid persistent motor saturation.
-  R_diag: [1.0e-5, 1.0e-5, 1.0e-5]
+  R_diag: [1.0, 1.0, 1.0]
+
+# Yaw rate damper (separate from LQR)
+# Applies proportional damping to yaw rate: tau_yaw_cmd = -k_r * r
+# Very light — just prevents runaway spin without fighting the
+# residual yaw torque too aggressively.
+yaw_damper:
+  k_r: 0.01
 
 # Outer-loop altitude PID
 altitude_pid:

@@ -13,7 +13,7 @@ int main(int argc, char* argv[]) {
 
     std::cout << "========================================\n";
     std::cout << "  Tricopter LQR Flight Controller\n";
-    std::cout << "  Cascaded: Attitude LQR + Altitude PID\n";
+    std::cout << "  Roll/Pitch LQR + Yaw Damper + Alt PID\n";
     std::cout << "========================================\n\n";
 
     // 1. Load config
@@ -37,16 +37,20 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    // 4. Build attitude LQR
-    AttitudeLQR lqr;
+    // 4. Build roll/pitch LQR (4-state)
+    RollPitchLQR lqr;
     if (!lqr.build(cfg, alloc)) {
-        std::cerr << "LQR build failed — system is unstable!\n";
+        std::cerr << "Roll/pitch LQR build failed — system is unstable!\n";
         return 1;
     }
 
-    // 5. Run simulation
+    // 5. Build yaw rate damper
+    YawDamper yaw_damper;
+    yaw_damper.build(cfg, alloc);
+
+    // 6. Run simulation
     Simulation sim;
-    sim.run(cfg, alloc, trim, lqr, "sim_output.csv");
+    sim.run(cfg, alloc, trim, lqr, yaw_damper, "sim_output.csv");
 
     return 0;
 }

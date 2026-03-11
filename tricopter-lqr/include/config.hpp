@@ -15,10 +15,15 @@ struct RotorConfig {
     double k_Q;                    // drag torque coeff: Q = k_Q * omega^2
 };
 
-/// Attitude LQR tuning
+/// Roll/pitch LQR tuning (4-state: phi, theta, p, q)
 struct AttitudeLQRConfig {
-    Eigen::Matrix<double, 6, 1> Q_diag;  // 6 diagonal weights for Q
-    Eigen::Vector3d R_diag;               // 3 diagonal weights for R
+    Eigen::Vector4d Q_diag;  // 4 diagonal weights: [q_phi, q_theta, q_p, q_q]
+    Eigen::Vector3d R_diag;  // 3 diagonal weights for R
+};
+
+/// Yaw rate damper tuning
+struct YawDamperConfig {
+    double k_r;  // proportional gain on yaw rate
 };
 
 /// Altitude PID tuning
@@ -49,6 +54,7 @@ struct Config {
     Eigen::Matrix3d J;                // full 3x3 inertia tensor
     std::vector<RotorConfig> rotors;  // variable number of rotors
     AttitudeLQRConfig att_lqr;
+    YawDamperConfig yaw_damper;
     AltitudePIDConfig alt_pid;
     SimConfig sim;
     double omega_max;                 // motor speed limit [rad/s]
