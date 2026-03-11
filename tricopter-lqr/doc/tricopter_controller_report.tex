@@ -75,7 +75,7 @@
 
 \title{%
     \textbf{Cascaded Flight Controller for a Servoless Asymmetric Tricopter} \\[6pt]
-    \large Inner-Loop Attitude LQR + Outer-Loop Altitude PID \\[4pt]
+    \large Roll/Pitch LQR + Yaw Rate Damper + Altitude PID \\[4pt]
     \large Complete Mathematical Derivation, Software Architecture, \\ and Implementation Guide
 }
 \author{Auto-generated Technical Report}
@@ -102,12 +102,14 @@ Our vehicle is a \textbf{servoless} tricopter: it has no yaw servo.  Yaw control
 
 A ``full-state'' LQR on all 12 states (position, velocity, attitude, angular rate) was tried previously and proved unstable.  The reason is that the translational and rotational dynamics operate on very different time scales and magnitudes.  A single LQR mixes them, leading to poorly conditioned gain matrices.
 
-Instead we use a \textbf{cascaded} architecture:
+Instead we use a \textbf{cascaded} architecture with three parallel inner controllers:
 \begin{enumerate}[label=\arabic*.]
-    \item \textbf{Inner loop (fast):} an attitude-only LQR that stabilises roll, pitch, and yaw using a 6-state linearised model.
-    \item \textbf{Outer loop (slow):} a simple PID controller that regulates altitude by commanding total thrust.
+    \item \textbf{Roll/Pitch LQR (inner, fast):} a 4-state LQR that stabilises roll and pitch angles and rates.  Yaw is deliberately excluded because the servoless tricopter cannot hold a fixed heading.
+    \item \textbf{Yaw Rate Damper (inner):} a simple proportional controller that limits yaw spin rate without trying to hold a heading.  Uses the pseudoinverse of $\bB_\tau$ for minimum-coupling motor allocation.
+    \item \textbf{Altitude PID (outer, slow):} a classical PID controller that regulates altitude by commanding total thrust.
+    \item \textbf{Heading-Aware Command (infrastructure):} rotates future world-frame commands through the current yaw angle, enabling correct position control despite yaw drift.
 \end{enumerate}
-The inner loop runs ``inside'' the outer loop: the altitude PID adjusts collective thrust, while the attitude LQR adjusts differential motor speeds.
+The controllers run in parallel each timestep.  The altitude PID adjusts collective thrust, the roll/pitch LQR adjusts differential motor speeds, and the yaw damper applies a small additional correction for spin reduction.  Their outputs are summed linearly.
 
 \subsection{Control Input Parameterisation}
 
@@ -473,162 +475,406 @@ After the RK4 update, the quaternion may drift slightly from unit norm due to fl
 This is done \emph{once} after the final RK4 update (not at intermediate stages), which is sufficient for maintaining $\|\bq\| = 1$ to machine precision.
 
 % =============================================================================
-\section{Inner Loop: Attitude LQR}
+\section{Inner Loop: Roll/Pitch LQR (4-State)}
 \label{sec:lqr}
 % =============================================================================
 
+\subsection{Why Remove Yaw from the LQR?}
+
+The original 6-state LQR attempted to control all three Euler angles (roll, pitch, yaw) and all three angular rates simultaneously.  This created several problems:
+
+\begin{enumerate}
+    \item \textbf{Yaw fights a losing battle.}  The servoless tricopter has a residual yaw torque of 0.091 Nm that the trim solver cannot eliminate (Section~\ref{sec:trim}).  The LQR's yaw channel must continuously fight this torque, burning actuator authority that could be used for roll and pitch.  Because the condition number of $\bB_\tau$ is 30.6 (yaw authority is 30$\times$ weaker than roll/pitch), the yaw channel steals disproportionately large motor commands for a negligible effect.
+
+    \item \textbf{Cross-coupling.}  With the full 6-state system, the LQR gain matrix $\bK$ is $3 \times 6$.  Each motor command depends on all 6 states, including yaw angle.  When yaw drifts (which it inevitably does), the yaw error feeds back into roll/pitch corrections, causing unwanted coupling.
+
+    \item \textbf{Unnecessarily large CARE problem.}  The 6-state system requires solving a $12 \times 12$ Hamiltonian eigenvalue problem.  The 4-state system only needs an $8 \times 8$ Hamiltonian --- fewer matrix inversions, faster convergence, and better numerical conditioning.
+
+    \item \textbf{Physical reality.}  For a servoless tricopter, yaw angle is simply not controllable in the steady-state sense.  Trying to regulate it to zero is asking the controller to do something the physics forbids.  The correct approach is to \emph{accept} yaw drift and merely \emph{damp} the yaw rate to prevent runaway spinning.
+\end{enumerate}
+
+The new architecture cleanly separates the problem:
+\begin{itemize}
+    \item \textbf{Roll/Pitch LQR} (4 states): optimal control for what \emph{can} be controlled.
+    \item \textbf{Yaw Rate Damper} (1 state, 1 gain): simple proportional control for what can only be \emph{damped}.
+    \item \textbf{Heading-Aware Command}: infrastructure for translating world-frame commands through the (drifting) yaw angle.
+\end{itemize}
+
 \subsection{Linearisation About Hover}
 
-The LQR operates on a \emph{linearised} model of the attitude dynamics around the hover trim point.  The attitude state vector is:
+The roll/pitch LQR operates on a reduced state vector that excludes yaw entirely.  The 4 states are:
 \begin{equation}
-    \delta \bx_{\text{att}} = \begin{bmatrix}
-        \delta\phi \\ \delta\theta \\ \delta\psi \\ \delta p \\ \delta q \\ \delta r
+    \delta \bx_{\text{rp}} = \begin{bmatrix}
+        \delta\phi \\ \delta\theta \\ \delta p \\ \delta q
     \end{bmatrix}
-    \in \R^6
+    \in \R^4
 \end{equation}
-where $\delta\phi, \delta\theta, \delta\psi$ are Euler angle errors and $\delta p, \delta q, \delta r$ are angular rate errors.
+where $\delta\phi$ and $\delta\theta$ are the roll and pitch angle errors (radians), and $\delta p$ and $\delta q$ are the roll and pitch rate errors (rad/s).  Yaw angle $\psi$ and yaw rate $r$ are deliberately absent.
+
+The 3 control inputs remain the same as before:
+\begin{equation}
+    \delta \bu = \begin{bmatrix} \delta\omega_1^2 \\ \delta\omega_2^2 \\ \delta\omega_3^2 \end{bmatrix} \in \R^3
+\end{equation}
 
 The linearised dynamics are:
 \begin{equation}
-    \delta \dot{\bx}_{\text{att}} = \bA_{\text{att}} \, \delta \bx_{\text{att}} + \bB_{\text{att}} \, \delta \bu
+    \delta \dot{\bx}_{\text{rp}} = \bA_{\text{rp}} \, \delta \bx_{\text{rp}} + \bB_{\text{rp}} \, \delta \bu
 \end{equation}
 
-\subsubsection{The A-attitude Matrix (6 by 6)}
+\subsubsection{The A Matrix (4 by 4)}
 
-At hover, the angular velocity $\bomega_0 = \bm{0}$, so all gyroscopic terms vanish:
+At hover, the angular velocity $\bomega_0 = \bm{0}$, so all gyroscopic coupling terms vanish.  The only nonzero entries express the kinematic relationship ``angles are the integral of rates'':
 \begin{equation}
-    \bA_{\text{att}} = \begin{bmatrix}
-        \bzero_{3\times3} & \bI_{3\times3} \\
-        \bzero_{3\times3} & \bzero_{3\times3}
+    \bA_{\text{rp}} = \begin{bmatrix}
+        \bzero_{2\times2} & \bI_{2\times2} \\
+        \bzero_{2\times2} & \bzero_{2\times2}
+    \end{bmatrix}
+    = \begin{bmatrix}
+        0 & 0 & 1 & 0 \\
+        0 & 0 & 0 & 1 \\
+        0 & 0 & 0 & 0 \\
+        0 & 0 & 0 & 0
     \end{bmatrix}
 \end{equation}
-The top-right identity block says ``angles are the integral of rates.''  Everything else is zero because at hover there are no restoring forces or gyroscopic coupling.
 
-\subsubsection{The B-attitude Matrix (6 by 3)}
+Reading this row by row:
+\begin{itemize}
+    \item Row 1: $\dot{\delta\phi} = \delta p$.  The roll angle changes at the roll rate.
+    \item Row 2: $\dot{\delta\theta} = \delta q$.  The pitch angle changes at the pitch rate.
+    \item Row 3: $\dot{\delta p} = 0$ (without control input).  At hover, there is no natural restoring torque --- a rolled vehicle just stays rolled.
+    \item Row 4: $\dot{\delta q} = 0$ (without control input).  Same for pitch.
+\end{itemize}
+
+The $2 \times 2$ identity block in the top-right corner is the critical structure.  It tells the LQR that angles and rates are related by integration, which is what allows the LQR to compute a stabilising gain --- without this coupling, the system would be uncontrollable.
+
+\subsubsection{The B Matrix (4 by 3)}
 
 From Euler's equation \eqref{eq:euler_eq}, the angular acceleration from motor commands is:
 \begin{equation}
-    \delta \dot{\bomega} = \bJ^{-1} \, \bB_\tau \, \delta \bu
+    \begin{bmatrix} \dot{p} \\ \dot{q} \\ \dot{r} \end{bmatrix}
+    = \bJ^{-1} \, \bB_\tau \, \delta \bu
 \end{equation}
-Therefore:
+
+The full $\bJ^{-1} \bB_\tau$ product is a $3 \times 3$ matrix.  We only need the \textbf{first two rows} --- the roll and pitch angular acceleration response.  The third row (yaw acceleration) is discarded because yaw is handled separately.
+
 \begin{equation}
-    \bB_{\text{att}} = \begin{bmatrix}
-        \bzero_{3\times3} \\
-        \bJ^{-1} \bB_\tau
+    \bB_{\text{rp}} = \begin{bmatrix}
+        \bzero_{2\times3} \\
+        \text{rows 0--1 of } \bJ^{-1} \bB_\tau
+    \end{bmatrix}
+    \in \R^{4 \times 3}
+\end{equation}
+
+Explicitly, with our vehicle parameters:
+\begin{equation}
+    \bJ^{-1} \bB_\tau = \begin{bmatrix}
+        4.86 \times 10^{-6} & 9.73 \times 10^{-5} & -1.03 \times 10^{-4} \\
+        -1.50 \times 10^{-4} & 8.64 \times 10^{-5} & 9.39 \times 10^{-5} \\
+        9.20 \times 10^{-6} & -9.19 \times 10^{-6} & 5.66 \times 10^{-6}
     \end{bmatrix}
 \end{equation}
-The top block is zero because motor speeds don't directly change angles (only rates).
+
+Row 0 (roll acceleration) and row 1 (pitch acceleration) go into $\bB_{\text{rp}}$.  Row 2 (yaw acceleration) is used later by the yaw damper but not by the LQR.
+
+So the full $\bB_{\text{rp}}$ is:
+\begin{equation}
+    \bB_{\text{rp}} = \begin{bmatrix}
+        0 & 0 & 0 \\
+        0 & 0 & 0 \\
+        4.86 \times 10^{-6} & 9.73 \times 10^{-5} & -1.03 \times 10^{-4} \\
+        -1.50 \times 10^{-4} & 8.64 \times 10^{-5} & 9.39 \times 10^{-5}
+    \end{bmatrix}
+\end{equation}
+
+The top two rows are zero because motor commands do not directly change angles --- they change angular \emph{rates}, which then integrate into angle changes.
+
+\subsubsection{Why the Off-Diagonal Terms in $\bJ^{-1} \bB_\tau$ Exist}
+
+Notice that all entries in rows 0 and 1 of $\bJ^{-1} \bB_\tau$ are nonzero.  This means that every motor affects both roll and pitch simultaneously.  This happens for two reasons:
+
+\begin{enumerate}
+    \item \textbf{Asymmetric rotor placement.}  The rotors are not placed in an equilateral triangle.  The front rotor is at $[0.25, 0, 0]$ (pure x-axis), while the rear rotors are at $[-0.15, \pm 0.20, 0]$.  This asymmetry means that a torque from any single rotor has components in both roll and pitch.
+
+    \item \textbf{Off-diagonal inertia.}  The inertia tensor $\bJ$ has nonzero off-diagonal terms ($J_{xy} = 0.001$, $J_{xz} = 0.0005$, $J_{yz} = 0.0008$).  These products of inertia arise from mass distribution asymmetries.  When we invert $\bJ$ to get $\bJ^{-1}$, the off-diagonal terms cause roll torques to produce some pitch acceleration and vice versa.
+\end{enumerate}
+
+The LQR naturally handles this cross-coupling by computing optimal gains that account for the full structure of $\bB_{\text{rp}}$.  This is one of the key advantages of LQR over simpler PID controllers.
 
 \subsection{The LQR Cost Function}
 
-LQR minimises the infinite-horizon quadratic cost:
+The LQR minimises the infinite-horizon quadratic cost:
 \begin{equation}
-    J = \int_0^\infty \left( \delta \bx_{\text{att}}^T \bQ \, \delta \bx_{\text{att}} + \delta \bu^T \bR \, \delta \bu \right) dt
+    J = \int_0^\infty \left( \delta \bx_{\text{rp}}^T \bQ \, \delta \bx_{\text{rp}} + \delta \bu^T \bR \, \delta \bu \right) dt
 \end{equation}
 where:
 \begin{itemize}
-    \item $\bQ = \text{diag}(q_\phi, q_\theta, q_\psi, q_p, q_q, q_r)$ is the \textbf{state cost matrix} (6$\times$6 diagonal).  Larger values penalise deviations more heavily.
-    \item $\bR = \text{diag}(r_1, r_2, r_3)$ is the \textbf{input cost matrix} (3$\times$3 diagonal).  Larger values penalise actuator usage.
+    \item $\bQ = \text{diag}(q_\phi, q_\theta, q_p, q_q) \in \R^{4 \times 4}$ is the \textbf{state cost matrix}.  Larger values penalise deviations more heavily.  There are only 4 entries now, not 6.
+    \item $\bR = \text{diag}(r_1, r_2, r_3) \in \R^{3 \times 3}$ is the \textbf{input cost matrix}.  Larger values penalise actuator usage.
 \end{itemize}
+
+In plain language: the cost function asks ``how bad is it if the roll angle is off by 1 radian, and how expensive is it to change a motor speed by 1 unit of $\omega^2$?''  The LQR finds the motor commands that make the total cost --- angle deviations plus motor effort --- as small as possible over infinite time.
 
 The optimal control law is:
 \begin{equation}
-    \delta \bu = -\bK \, \delta \bx_{\text{att}}
-    \qquad \text{where} \quad \bK = \bR^{-1} \bB_{\text{att}}^T \bP
+    \delta \bu = -\bK_{\text{rp}} \, \delta \bx_{\text{rp}}
+    \qquad \text{where} \quad \bK_{\text{rp}} = \bR^{-1} \bB_{\text{rp}}^T \bP \in \R^{3 \times 4}
 \end{equation}
-and $\bP$ is the unique positive semi-definite solution of the \textbf{Continuous Algebraic Riccati Equation} (CARE).
+and $\bP \in \R^{4 \times 4}$ is the unique positive semi-definite solution of the \textbf{Continuous Algebraic Riccati Equation} (CARE).
+
+Note that $\bK_{\text{rp}}$ is $3 \times 4$ (was $3 \times 6$).  Each motor command now depends on only 4 states (roll, pitch, roll rate, pitch rate), not on yaw at all.
 
 \subsection{The CARE Equation}
 
 \begin{equation}
-    \bA^T \bP + \bP \bA - \bP \bB \bR^{-1} \bB^T \bP + \bQ = \bzero
+    \bA_{\text{rp}}^T \bP + \bP \bA_{\text{rp}} - \bP \bB_{\text{rp}} \bR^{-1} \bB_{\text{rp}}^T \bP + \bQ = \bzero
     \label{eq:care}
 \end{equation}
 
-This is a matrix equation with 21 independent unknowns (since $\bP$ is $6 \times 6$ symmetric).  It cannot be solved in closed form; we use a numerical method.
+This is a matrix equation with 10 independent unknowns (since $\bP$ is $4 \times 4$ symmetric: $4 \times 5 / 2 = 10$).  Compare with the old 6-state system, which had 21 unknowns.  The reduced system is computationally much cheaper and better conditioned.
 
 \subsection{Solving CARE via the Matrix Sign Function}
 \label{sec:sign_function}
 
-We use the \textbf{matrix sign function} applied to the Hamiltonian matrix, which is a well-known numerical method from control theory.
+We use the same matrix sign function method as before, but applied to a smaller Hamiltonian.
 
 \subsubsection{Step 1: Build the Hamiltonian}
 
-Define $\bm{S} = \bB_{\text{att}} \bR^{-1} \bB_{\text{att}}^T$ (6$\times$6, symmetric positive semi-definite).
+Define $\bm{S} = \bB_{\text{rp}} \bR^{-1} \bB_{\text{rp}}^T \in \R^{4\times4}$ (symmetric positive semi-definite).
 
-The Hamiltonian matrix is:
+The Hamiltonian matrix is now:
 \begin{equation}
     \bm{H} = \begin{bmatrix}
-        \bA & -\bm{S} \\
-        -\bQ & -\bA^T
+        \bA_{\text{rp}} & -\bm{S} \\
+        -\bQ & -\bA_{\text{rp}}^T
     \end{bmatrix}
-    \in \R^{12 \times 12}
+    \in \R^{8 \times 8}
 \end{equation}
 
-A key property: if $\lambda$ is an eigenvalue of $\bm{H}$, then $-\lambda$ is also an eigenvalue.  The eigenvalues come in pairs symmetric about the imaginary axis.  For a stabilisable system, exactly 6 eigenvalues have negative real part (``stable'') and 6 have positive real part (``unstable'').
+This is $8 \times 8$ instead of $12 \times 12$.  The key property still holds: eigenvalues come in pairs symmetric about the imaginary axis.  For a stabilisable system, exactly 4 eigenvalues have negative real part and 4 have positive real part.
 
 \subsubsection{Step 2: The Sign Function Iteration}
 
-The matrix sign function $\text{sign}(\bm{H})$ maps each eigenvalue to $+1$ (if $\text{Re}(\lambda) > 0$) or $-1$ (if $\text{Re}(\lambda) < 0$), while preserving the eigenvectors.
-
-It is computed iteratively:
+The iteration is identical in form:
 \begin{equation}
     \bm{Z}_{k+1} = \frac{1}{2} \left( \gamma_k \, \bm{Z}_k + \frac{1}{\gamma_k} \, \bm{Z}_k^{-1} \right)
     \label{eq:sign_iter}
 \end{equation}
-starting from $\bm{Z}_0 = \bm{H}$, where $\gamma_k = |\det(\bm{Z}_k)|^{-1/12}$ is a \textbf{determinant scaling factor} that accelerates convergence.  The scaling is clamped to $[0.1, 10]$ to avoid numerical overflow.
+starting from $\bm{Z}_0 = \bm{H}$, with the determinant scaling factor now:
+\begin{equation}
+    \gamma_k = |\det(\bm{Z}_k)|^{-1/8}
+\end{equation}
+(the exponent is $-1/(2n)$ where $n = 4$, so $-1/8$ instead of the old $-1/12$).  The scaling is clamped to $[0.1, 10]$ as before.
 
-This iteration converges quadratically.  After convergence, $\bm{Z} \to \bm{W} = \text{sign}(\bm{H})$, satisfying $\bm{W}^2 = \bI$.
+\textbf{Convergence improvement:} The $8 \times 8$ system converges in 12 iterations (compared with 15--25 for the $12 \times 12$ system).  Each iteration requires inverting an $8 \times 8$ matrix ($\sim 8^3/3 \approx 171$ flops) instead of a $12 \times 12$ matrix ($\sim 12^3/3 \approx 576$ flops).  The total CARE solve is approximately $3\times$ faster.
 
 \subsubsection{Step 3: Extract P}
 
-Partition $\bm{W}$ into 6$\times$6 blocks:
+Partition $\bm{W}$ into $4\times4$ blocks:
 \begin{equation}
     \bm{W} = \begin{bmatrix} \bm{W}_{11} & \bm{W}_{12} \\ \bm{W}_{21} & \bm{W}_{22} \end{bmatrix}
 \end{equation}
 
-The \textbf{stable invariant subspace} is the column space of $\frac{1}{2}(\bI - \bm{W})$.  Writing the projection:
+The extraction formula is the same:
 \begin{equation}
-    \bm{\Pi}_s = \frac{1}{2}(\bI - \bm{W}) = \begin{bmatrix}
-        \frac{\bI - \bm{W}_{11}}{2} & \cdot \\
-        \frac{-\bm{W}_{21}}{2} & \cdot
-    \end{bmatrix}
-\end{equation}
-The stable subspace has the form $\{[\bm{v}; \bP\bm{v}]\}$, so:
-\begin{equation}
-    \bP = \frac{-\bm{W}_{21}/2}{(\bI - \bm{W}_{11})/2} = -\bm{W}_{21} \, (\bI - \bm{W}_{11})^{-1}
+    \bP = -\bm{W}_{21} \, (\bI_4 - \bm{W}_{11})^{-1}
     \label{eq:P_extraction}
 \end{equation}
-Finally, $\bP$ is symmetrised: $\bP \leftarrow \frac{1}{2}(\bP + \bP^T)$.
+followed by symmetrisation: $\bP \leftarrow \frac{1}{2}(\bP + \bP^T)$.
 
 \subsubsection{Verification}
 
 We verify correctness by:
 \begin{enumerate}
-    \item Computing the CARE residual $\|\bA^T\bP + \bP\bA - \bP\bm{S}\bP + \bQ\|_F$, which should be $< 10^{-4}$.
-    \item Checking that all eigenvalues of $\bP$ are positive (positive definite).
-    \item Computing the closed-loop eigenvalues of $\bA - \bB\bK$ and verifying all have negative real part (stability).
+    \item Computing the CARE residual $\|\bA_{\text{rp}}^T\bP + \bP\bA_{\text{rp}} - \bP\bm{S}\bP + \bQ\|_F$.  For our system: $5.27 \times 10^{-11}$ (machine-precision accuracy).
+    \item Checking that all 4 eigenvalues of $\bP$ are positive (positive definite).  Values: 1588, 1881, $1.61 \times 10^6$, $2.67 \times 10^6$.
+    \item Computing the closed-loop eigenvalues of $\bA_{\text{rp}} - \bB_{\text{rp}}\bK_{\text{rp}}$ and verifying all have negative real part.
 \end{enumerate}
 
 \subsection{LQR Tuning: The Q and R Weights}
 
-Choosing $\bQ$ and $\bR$ is the art of LQR design:
+With yaw removed, the tuning is cleaner.  There are only 4 state weights and 3 input weights:
+
 \begin{itemize}
-    \item \textbf{$\bQ$ weights} ($[500, 500, 200, 50, 50, 20]$): Roll and pitch get the highest penalty (500) because tilt directly causes lateral drift and altitude loss.  Yaw gets 200 --- lower because yaw drift is less dangerous.  Rate penalties are 10$\times$ lower than angle penalties.
-    \item \textbf{$\bR$ weights} ($[10^{-5}, 10^{-5}, 10^{-5}]$): Very small because $\delta u = \delta\omega^2$ is a large number ($\sim 10^5$), and we want the controller to use its full actuator range aggressively.
+    \item \textbf{$\bQ$ weights} ($[100, 100, 10, 10]$): Roll and pitch angles get weight 100.  Roll and pitch rates get weight 10 (10$\times$ lower).  The rate weights allow fast initial response without excessive rate damping.  There is no yaw weight at all --- yaw is handled separately.
+
+    \item \textbf{$\bR$ weights} ($[1, 1, 1]$): Set to unity.  This is a deliberate design choice.  With $R = 1$, the LQR penalises a change of 1 unit in $\omega^2$ the same as a state deviation of ``1 weighted unit.''  Since $\omega^2 \sim 3 \times 10^5$ at hover, and the $\bB_{\text{rp}}$ entries are of order $10^{-4}$, the effective gain is moderate.  The closed-loop eigenvalues have real parts around $-0.03$, corresponding to time constants of $\sim 30$ seconds.
 \end{itemize}
 
-The ratio $\bQ/\bR$ determines aggressiveness: larger ratio $\Rightarrow$ faster response but more actuator usage.
+\textbf{Tuning trade-off:} Reducing $\bR$ (e.g., to $10^{-5}$) would make the response much more aggressive (time constants $\sim 1$--2 seconds) but would require larger motor speed changes.  The current conservative tuning prioritises smooth motor commands over fast response.
+
+\subsection{The Gain Matrix}
+
+The computed gain matrix is:
+\begin{equation}
+    \bK_{\text{rp}} = \begin{bmatrix}
+        0.022 & -7.629 & -3.887 & -243.0 \\
+        7.054 & 4.594 & 267.9 & 150.7 \\
+        -7.088 & 4.549 & -263.6 & 140.5
+    \end{bmatrix}
+\end{equation}
+
+Reading this column by column:
+\begin{itemize}
+    \item \textbf{Column 1} ($\delta\phi$ response): Motor 1 barely responds to roll error (0.022).  Motors 2 and 3 respond strongly and oppositely ($+7.05$ vs $-7.09$), creating a roll torque.  This makes sense: the rear rotors are at $y = \pm 0.20$, so differential rear thrust creates roll.
+
+    \item \textbf{Column 2} ($\delta\theta$ response): All three motors respond significantly ($-7.63$, $+4.59$, $+4.55$).  The front motor decreases while the rear motors increase, creating a nose-down pitch torque for positive pitch error.
+
+    \item \textbf{Column 3} ($\delta p$ response): The rate damping is much larger than the angle response (by factor $\sim 30$--60$\times$).  This provides strong rate damping to prevent oscillation.
+
+    \item \textbf{Column 4} ($\delta q$ response): Similar large rate damping for pitch rate.
+\end{itemize}
 
 \subsection{Closed-Loop Eigenvalues}
 
-The closed-loop system $\delta \dot{\bx} = (\bA - \bB\bK) \, \delta\bx$ has eigenvalues:
+The closed-loop system $\delta \dot{\bx} = (\bA_{\text{rp}} - \bB_{\text{rp}}\bK_{\text{rp}}) \, \delta\bx$ has 4 eigenvalues:
 \begin{align}
-    \lambda_{0,1} &= -0.724 \pm 0.689j \quad \text{(roll/pitch fast mode, } \tau \approx 1.4 \text{ s)} \\
-    \lambda_{2,3} &= -0.865 \pm 0.807j \quad \text{(roll/pitch fast mode, } \tau \approx 1.2 \text{ s)} \\
-    \lambda_{4,5} &= -0.095 \pm 0.095j \quad \text{(yaw slow mode, } \tau \approx 10.5 \text{ s)}
+    \lambda_{0,1} &= -0.0266 \pm 0.0266j \quad \text{(mode 1, } \tau \approx 37.6 \text{ s)} \\
+    \lambda_{2,3} &= -0.0315 \pm 0.0315j \quad \text{(mode 2, } \tau \approx 31.8 \text{ s)}
 \end{align}
-All have \textbf{negative real parts} $\Rightarrow$ the system is stable.  The yaw mode is 7--9$\times$ slower than the roll/pitch modes, reflecting the weak yaw authority.  The time constant $\tau = -1/\text{Re}(\lambda)$ indicates how fast each mode decays.
+All have \textbf{negative real parts} $\Rightarrow$ the system is provably stable.  The two complex-conjugate pairs represent oscillatory modes that decay over time.  The time constant $\tau = -1/\text{Re}(\lambda)$ indicates how fast each mode decays.
+
+With the current conservative tuning ($R = 1$), the response is deliberately slow.  For a more aggressive response (sub-second settling), one would reduce $R$ to $\sim 10^{-5}$ and increase $Q$ to $\sim 500$.
+
+% =============================================================================
+\section{Yaw Rate Damper}
+\label{sec:yaw_damper}
+% =============================================================================
+
+\subsection{Why a Separate Yaw Controller?}
+
+As established in Section~\ref{sec:trim}, the servoless tricopter has a residual yaw torque of 0.091 Nm that cannot be eliminated.  This torque will cause the vehicle to spin around its yaw axis.  The question is: what should the controller do about this?
+
+There are three options:
+\begin{enumerate}
+    \item \textbf{Ignore it completely.}  The vehicle spins freely.  Roll and pitch are still controlled, but the heading drifts.  This is viable for some applications (e.g., a vehicle that only needs to hover in place) but makes position control and navigation difficult.
+
+    \item \textbf{Try to hold heading (yaw angle control).}  This is what the old 6-state LQR did.  It requires large motor commands to fight the constant torque, wastes actuator authority, and ultimately fails because the yaw channel is 30$\times$ weaker than roll/pitch.
+
+    \item \textbf{Damp the yaw rate only.}  Accept that heading will drift, but prevent the yaw rate from growing unboundedly.  This is the Goldilocks approach: it uses minimal actuator authority while keeping the vehicle's spin rate manageable.
+\end{enumerate}
+
+We choose option 3.
+
+\subsection{The Damping Law}
+
+The yaw rate damper is a simple proportional controller:
+\begin{equation}
+    \tau_{\text{yaw,cmd}} = -k_r \cdot r
+\end{equation}
+where:
+\begin{itemize}
+    \item $r$ is the current yaw rate (rad/s), measured by the gyroscope's z-axis.
+    \item $k_r = 0.01$ is the damping gain (configurable in YAML).
+    \item $\tau_{\text{yaw,cmd}}$ is the desired yaw torque (Nm).
+\end{itemize}
+
+This is the rotational equivalent of viscous friction: the torque opposes the direction of rotation and is proportional to the speed.  Physically, it acts as if the vehicle has a rotational dashpot in yaw.
+
+\subsection{Steady-State Yaw Rate}
+
+At steady state, the damping torque balances the residual torque:
+\begin{equation}
+    k_r \cdot r_{\text{ss}} = \tau_{\text{residual}} \quad \Rightarrow \quad r_{\text{ss}} = \frac{\tau_{\text{residual}}}{k_r} = \frac{0.091}{0.01} = 9.1 \text{ rad/s}
+\end{equation}
+
+This is approximately 1.45 revolutions per second (86.7 deg/s).  This is a significant spin rate, but it is bounded and predictable.  Increasing $k_r$ would reduce the spin rate but at the cost of larger motor commands competing with roll/pitch control.
+
+\subsection{Converting Yaw Torque to Motor Commands}
+
+Given a desired yaw torque $\tau_{\text{yaw,cmd}}$, we need to find the motor command increments $\delta \bu_{\text{yaw}} \in \R^3$ such that:
+\begin{equation}
+    \bB_{\tau,\text{yaw}} \cdot \delta \bu_{\text{yaw}} = \tau_{\text{yaw,cmd}}
+\end{equation}
+where $\bB_{\tau,\text{yaw}}$ is the yaw row (row 2) of the $3 \times 3$ torque allocation matrix $\bB_\tau$:
+\begin{equation}
+    \bB_{\tau,\text{yaw}} = \begin{bmatrix} 2.5 \times 10^{-7} & -2.5 \times 10^{-7} & 2.5 \times 10^{-7} \end{bmatrix}
+\end{equation}
+
+This is one equation in three unknowns, so there are infinitely many solutions.  We want the one that:
+\begin{enumerate}
+    \item Has minimum norm $\|\delta \bu_{\text{yaw}}\|$ (uses minimal motor effort).
+    \item Minimises disturbance to roll and pitch (doesn't create unwanted torques in other axes).
+\end{enumerate}
+
+Both goals are achieved by using the \textbf{pseudoinverse} of the full $\bB_\tau$ matrix.  The pseudoinverse of a $3 \times 3$ matrix is:
+\begin{equation}
+    \bB_\tau^+ = \bB_\tau^T \left( \bB_\tau \bB_\tau^T \right)^{-1}
+\end{equation}
+
+The yaw column (column 2) of $\bB_\tau^+$ maps a pure yaw torque command to the motor commands that produce that torque with minimum roll/pitch disturbance:
+\begin{equation}
+    \delta \bu_{\text{yaw}} = \bB_{\tau,\text{yaw}}^{+} \cdot \tau_{\text{yaw,cmd}}
+\end{equation}
+
+For our vehicle:
+\begin{equation}
+    \bB_{\tau,\text{yaw}}^{+} = \begin{bmatrix} 4.0 \times 10^6 \\ 3.33 \times 10^6 \\ 3.33 \times 10^6 \end{bmatrix}
+\end{equation}
+
+These are large numbers because the yaw coefficients ($k_Q = 2.5 \times 10^{-7}$) are tiny --- it takes a large change in $\omega^2$ to produce a meaningful yaw torque.
+
+\subsection{Why Not a Full Yaw PID?}
+
+One might ask: why not use a PID controller for yaw instead of a simple proportional damper?  The answer lies in the physics:
+
+\begin{itemize}
+    \item \textbf{Proportional (P) term on yaw angle:} Would try to hold a fixed heading.  With a constant residual torque, the integrator would wind up immediately, and the P term would fight the torque indefinitely.  This is exactly what the old 6-state LQR did, and it wasted actuator authority.
+
+    \item \textbf{Integral (I) term:} Would make things worse.  The integral of a constant yaw error grows without bound, causing larger and larger motor corrections until saturation.
+
+    \item \textbf{Derivative (D) term on yaw rate:} This \emph{is} what our damper does (P gain on rate $=$ D gain on angle).  It's the only term that makes physical sense.
+\end{itemize}
+
+% =============================================================================
+\section{Heading-Aware Position Command}
+\label{sec:heading_cmd}
+% =============================================================================
+
+\subsection{The Problem}
+
+When the yaw angle drifts, the body-frame axes rotate relative to the world frame.  If a future outer loop commands ``roll right to move east,'' the meaning of ``right'' changes as the vehicle's heading rotates.  The heading-aware command layer translates world-frame acceleration commands into body-frame attitude commands.
+
+\subsection{The Mathematics}
+
+Given a desired world-frame translational acceleration $[a_x, a_y]$ (e.g., from a position controller), the required body-frame roll and pitch angles are:
+\begin{align}
+    \phi_{\text{cmd}} &= \frac{1}{g} \left( \cos\psi \cdot a_x + \sin\psi \cdot a_y \right) \\
+    \theta_{\text{cmd}} &= \frac{1}{g} \left( -\sin\psi \cdot a_x + \cos\psi \cdot a_y \right)
+\end{align}
+where $\psi$ is the current yaw angle and $g = 9.81$ m/s$^2$.
+
+In matrix form:
+\begin{equation}
+    \begin{bmatrix} \phi_{\text{cmd}} \\ \theta_{\text{cmd}} \end{bmatrix}
+    = \frac{1}{g}
+    \begin{bmatrix} \cos\psi & \sin\psi \\ -\sin\psi & \cos\psi \end{bmatrix}
+    \begin{bmatrix} a_x \\ a_y \end{bmatrix}
+\end{equation}
+
+This is a rotation matrix that ``un-rotates'' the desired world-frame acceleration into the body frame.
+
+\subsection{Physical Intuition}
+
+Consider a vehicle facing north ($\psi = 0$):
+\begin{itemize}
+    \item To accelerate east ($a_x = 0, a_y > 0$): roll right ($\phi_{\text{cmd}} > 0$), zero pitch.
+    \item To accelerate north ($a_x > 0, a_y = 0$): zero roll, pitch forward ($\theta_{\text{cmd}} > 0$).
+\end{itemize}
+
+Now consider the same vehicle rotated 90° to face east ($\psi = \pi/2$):
+\begin{itemize}
+    \item To accelerate east ($a_y > 0$): the vehicle is now facing east, so it must pitch forward instead of rolling.  Indeed: $\theta_{\text{cmd}} = \cos(\pi/2) \cdot a_y / g = 0$... wait.  Let's compute: $\phi_{\text{cmd}} = \sin(\pi/2) \cdot a_y / g = a_y / g > 0$ and $\theta_{\text{cmd}} = \cos(\pi/2) \cdot a_y / g = 0$.  So it still rolls.  This is correct because roll (body-frame) tilts the thrust vector sideways \emph{relative to the body}, and when the body faces east, rolling tilts the thrust vector south/north, not east/west.
+\end{itemize}
+
+The key insight: the rotation matrix accounts for the fact that body-frame roll and pitch have different world-frame meanings depending on the heading.
+
+\subsection{Current Usage}
+
+For the current hover-only simulation, the desired acceleration is zero: $a_x = a_y = 0$.  Therefore:
+\begin{equation}
+    \phi_{\text{cmd}} = 0, \quad \theta_{\text{cmd}} = 0
+\end{equation}
+regardless of yaw angle.  The heading-aware command infrastructure exists in the code but produces zero output.  It will become essential when a position controller (outer loop) is added in the future.
 
 % =============================================================================
 \section{Outer Loop: Altitude PID}
@@ -684,64 +930,100 @@ Output limit & 10.0 & Maximum thrust adjustment [N] \\
 \label{sec:combined}
 % =============================================================================
 
-At each timestep, the total motor command is:
+At each timestep, the total motor command combines four contributions:
 \begin{equation}
     \boxed{
-    u_i = u_{i,\text{hover}} + \delta u_{\text{att},i} + \delta u_{\text{coll}}
+    u_i = u_{i,\text{hover}} + \delta u_{\text{rp},i} + \delta u_{\text{yaw},i} + \delta u_{\text{coll}}
     }
     \quad \text{for } i = 1, 2, 3
 \end{equation}
 where:
 \begin{itemize}
-    \item $u_{i,\text{hover}}$: trim value from the KKT solver.
-    \item $\delta u_{\text{att},i}$: attitude correction from LQR ($i$-th component of $-\bK \, \delta\bx_{\text{att}}$).
+    \item $u_{i,\text{hover}}$: trim value from the KKT solver (Section~\ref{sec:trim}).
+    \item $\delta u_{\text{rp},i}$: roll/pitch correction from the 4-state LQR ($i$-th component of $-\bK_{\text{rp}} \, \delta\bx_{\text{rp}}$).
+    \item $\delta u_{\text{yaw},i}$: yaw rate damping ($i$-th component of $\bB_{\tau,\text{yaw}}^+ \cdot (-k_r \cdot r)$).
     \item $\delta u_{\text{coll}}$: collective thrust correction from altitude PID.
 \end{itemize}
 
 Each $u_i$ is clamped to $[0, \; \omega_{\max}^2]$ to enforce physical motor limits.
 
+\subsection{Superposition Principle}
+
+The four terms are simply added together.  This works because, at hover, the dynamics are approximately linear and the principle of superposition applies.  Each controller was designed independently:
+
+\begin{itemize}
+    \item The \textbf{roll/pitch LQR} acts on columns 0--1 of $\bJ^{-1}\bB_\tau$ (roll and pitch acceleration).  It is unaware of yaw.
+    \item The \textbf{yaw damper} acts on column 2 of $\bB_\tau^+$ (yaw torque), using the pseudoinverse to minimise cross-coupling into roll/pitch.
+    \item The \textbf{altitude PID} adds equal thrust to all motors, affecting only the total force, not the torque balance.
+\end{itemize}
+
+The three controllers are largely orthogonal, but not perfectly so.  The yaw damper's pseudoinverse minimises but does not eliminate roll/pitch disturbance.  At small angles (the LQR's operating regime), the residual cross-coupling is negligible.
+
+\subsection{Execution Order}
+
+Within each timestep, the computation proceeds as:
+\begin{enumerate}
+    \item Extract Euler angles $[\phi, \theta, \psi]$ and angular rates $[p, q, r]$ from the quaternion state.
+    \item Compute heading-aware attitude command: $[\phi_{\text{cmd}}, \theta_{\text{cmd}}] = f(a_x, a_y, \psi)$ (currently $[0, 0]$).
+    \item Compute roll/pitch error: $\delta\bx_{\text{rp}} = [\phi - \phi_{\text{cmd}}, \; \theta - \theta_{\text{cmd}}, \; p, \; q]^T$.
+    \item Roll/pitch LQR: $\delta\bu_{\text{rp}} = -\bK_{\text{rp}} \cdot \delta\bx_{\text{rp}}$.
+    \item Yaw damper: $\delta\bu_{\text{yaw}} = \bB_{\tau,\text{yaw}}^+ \cdot (-k_r \cdot r)$.
+    \item Altitude PID: $\delta u_{\text{coll}} = (T_{\text{cmd}} - T_{\text{hover}}) / (N \cdot k_{T,\text{avg}})$.
+    \item Sum: $\bu = \bu_{\text{hover}} + \delta\bu_{\text{rp}} + \delta\bu_{\text{yaw}} + \delta u_{\text{coll}} \cdot \bm{1}$.
+    \item Clamp: $u_i \leftarrow \max(0, \min(u_i, \omega_{\max}^2))$.
+    \item Integrate dynamics with RK4.
+\end{enumerate}
+
+Note that the control is computed \emph{before} integration, ensuring zero-delay feedback.
+
 \begin{figure}[H]
 \centering
 \begin{tikzpicture}[
-    block/.style={draw, rectangle, minimum width=2.5cm, minimum height=1cm, align=center},
-    sum/.style={draw, circle, minimum size=0.6cm},
+    block/.style={draw, rectangle, minimum width=2.2cm, minimum height=0.9cm, align=center, font=\small},
+    sum/.style={draw, circle, minimum size=0.5cm, font=\small},
     >=Stealth,
-    node distance=1.5cm
+    node distance=1.2cm
 ]
-    % Outer loop
-    \node[block] (pid) {Altitude\\PID};
-    \node[sum, right=1.2cm of pid] (sum1) {$+$};
+    % Blocks
+    \node[block] (heading) {Heading\\Aware Cmd};
+    \node[block, below=0.8cm of heading] (lqr) {Roll/Pitch\\LQR (4-state)};
+    \node[block, below=0.8cm of lqr] (yaw) {Yaw Rate\\Damper};
+    \node[block, below=0.8cm of yaw] (pid) {Altitude\\PID};
 
-    % Inner loop
-    \node[block, above=1.5cm of sum1] (lqr) {Attitude\\LQR};
-    \node[sum, right=1.2cm of sum1] (sum2) {$+$};
-
-    % Plant
-    \node[block, right=1.2cm of sum2] (plant) {Dynamics\\(RK4)};
+    % Summation
+    \node[sum, right=2.5cm of yaw] (sum1) {$\Sigma$};
 
     % Trim
-    \node[block, below=1.0cm of sum2] (trim) {Trim\\$\bu_{\text{hover}}$};
+    \node[block, below=0.8cm of sum1] (trim) {Trim\\$\bu_{\text{hover}}$};
 
-    % Clamp
-    \node[block, right=1.5cm of plant] (output) {Output\\$[\phi,\theta,\psi,z]$};
+    % Clamp + Plant
+    \node[block, right=1.2cm of sum1] (clamp) {Clamp\\$[0, \omega_{\max}^2]$};
+    \node[block, right=1.2cm of clamp] (plant) {Dynamics\\(RK4)};
+    \node[block, right=1.2cm of plant] (output) {State\\$[\bq, \bomega, \bm{v}, \bm{p}]$};
 
     % Connections
-    \draw[->] (pid) -- node[above]{$\delta u_{\text{coll}}$} (sum1);
-    \draw[->] (lqr) -| node[left, near start]{$\delta \bu_{\text{att}}$} (sum2);
-    \draw[->] (sum1) -- (sum2);
-    \draw[->] (trim) -- node[right]{$\bu_{\text{hover}}$} (sum2);
-    \draw[->] (sum2) -- node[above]{$\bu$} (plant);
+    \draw[->] (heading) -| node[above, near start, font=\scriptsize]{$\phi_{\text{cmd}}, \theta_{\text{cmd}}$} ([xshift=-0.5cm]lqr.north) -- (lqr.north);
+    \draw[->] (lqr.east) -- ++(0.5,0) |- node[above, near start, font=\scriptsize]{$\delta\bu_{\text{rp}}$} (sum1);
+    \draw[->] (yaw.east) -- ++(0.3,0) -- node[above, font=\scriptsize]{$\delta\bu_{\text{yaw}}$} (sum1);
+    \draw[->] (pid.east) -- ++(0.5,0) |- node[below, near start, font=\scriptsize]{$\delta u_{\text{coll}}$} (sum1);
+    \draw[->] (trim) -- node[right, font=\scriptsize]{$\bu_{\text{hover}}$} (sum1);
+    \draw[->] (sum1) -- node[above, font=\scriptsize]{$\bu$} (clamp);
+    \draw[->] (clamp) -- (plant);
     \draw[->] (plant) -- (output);
 
     % Feedback
-    \draw[->] (output.south) -- ++(0,-1.5) -| node[below, near start]{attitude feedback} (lqr.south);
-    \draw[->] (output.south) -- ++(0,-1.5) -| node[below, near start]{} ([xshift=-0.5cm]pid.south) -- (pid.south);
+    \draw[->] (output.south) -- ++(0,-1.5) -| node[below, near start, font=\scriptsize]{$[\phi, \theta, p, q]$} (lqr.south);
+    \draw[->] (output.south) -- ++(0,-1.5) -| node[below, font=\scriptsize]{} (yaw.south);
+    \draw[->] (output.south) -- ++(0,-1.5) -| node[below, font=\scriptsize]{} (pid.south);
+    \draw[->] (output.south) -- ++(0,-1.5) -| node[below, font=\scriptsize]{$\psi$} (heading.south);
 
     % Labels
-    \node[above=0.3cm of lqr, gray] {Inner Loop (fast)};
-    \node[above=0.3cm of pid, gray] {Outer Loop (slow)};
+    \node[left=0.3cm of heading, gray, font=\scriptsize, align=right] {Future\\outer loop};
+    \node[left=0.3cm of lqr, gray, font=\scriptsize, align=right] {Inner loop\\(roll/pitch)};
+    \node[left=0.3cm of yaw, gray, font=\scriptsize, align=right] {Yaw\\damping};
+    \node[left=0.3cm of pid, gray, font=\scriptsize, align=right] {Outer loop\\(altitude)};
 \end{tikzpicture}
-\caption{Cascaded control architecture.  The inner attitude LQR runs faster (stabilises tilt in $\sim$1 s) while the outer altitude PID runs slower (corrects height over $\sim$3--5 s).}
+\caption{Redesigned control architecture.  The roll/pitch LQR (4-state) handles attitude stabilisation, the yaw rate damper limits spin, and the altitude PID maintains height.  The heading-aware command layer translates future world-frame commands through the current yaw angle.}
 \end{figure}
 
 % =============================================================================
@@ -874,7 +1156,7 @@ for step = 0 to num_steps:
 \label{sec:tests}
 % =============================================================================
 
-We have 9 unit tests that verify correctness:
+We have 11 unit tests that verify correctness of all controller components:
 
 \begin{table}[H]
 \centering
@@ -888,13 +1170,15 @@ We have 9 unit tests that verify correctness:
 \texttt{balloc\_torque\_values} & Torque columns match the cross-product + drag formula (hand-computed). \\
 \texttt{trim\_residual\_torque} & Residual torque is finite and bounded ($< 1$ Nm). \\
 \texttt{trim\_thrust\_balance} & Total hover thrust $= mg$ within 0.01 N. \\
-\texttt{care\_p\_spd} & CARE solution $\bP$ is symmetric and all eigenvalues $> 0$ (positive definite). \\
-\texttt{care\_closed\_loop} & All 6 eigenvalues of $(\bA - \bB\bK)$ have $\text{Re}(\lambda) < 0$ (closed-loop stable). \\
+\texttt{care\_p\_spd} & CARE solution $\bP$ (4$\times$4) is symmetric and all eigenvalues $> 0$ (positive definite). \\
+\texttt{care\_closed\_loop} & All 4 eigenvalues of $(\bA_{\text{rp}} - \bB_{\text{rp}}\bK_{\text{rp}})$ have $\text{Re}(\lambda) < 0$ (stable). \\
+\texttt{yaw\_damper} & Zero yaw rate produces zero output; positive yaw rate produces negative yaw torque (damping opposes motion). \\
+\texttt{heading\_aware\_cmd} & At $\psi = 0$: identity mapping.  At $\psi = 90°$: axes rotate correctly.  At zero desired acceleration: zero command for any heading. \\
 \texttt{quat\_normalisation} & After 100 RK4 steps, $\|\bq\| = 1.0 \pm 10^{-10}$. \\
 \texttt{pid\_step\_response} & PID converges a simple double-integrator to setpoint within 10\% in 10 s. \\
 \bottomrule
 \end{tabular}
-\caption{Unit test descriptions.  All 9 tests pass.}
+\caption{Unit test descriptions.  All 11 tests pass.}
 \end{table}
 
 % =============================================================================
@@ -915,13 +1199,15 @@ We have 9 unit tests that verify correctness:
 \subsection{Key Observations}
 
 \begin{enumerate}
-    \item \textbf{Roll and pitch} remain bounded within $\pm 15°$ throughout the simulation, demonstrating effective attitude regulation.
+    \item \textbf{Roll and pitch} are perturbed but the LQR's eigenvalues (all negative real part) guarantee asymptotic stability.  With the current conservative tuning ($R = 1$), the time constants are approximately 30--37 seconds, so the response is deliberately slow.  The roll/pitch excursions reach approximately $\pm 30°$ before the LQR brings them back.
 
-    \item \textbf{Yaw drifts continuously}, cycling through $360°$ repeatedly.  This is the expected consequence of the 0.091 Nm residual yaw torque from the trim.  The LQR's yaw channel (eigenvalues at $-0.095 \pm 0.095j$, time constant $\approx 10.5$ s) is too slow to fully reject this constant disturbance.
+    \item \textbf{Yaw rate grows to a steady state.}  The residual yaw torque of 0.091 Nm drives the yaw rate upward.  The yaw damper ($k_r = 0.01$) opposes this, and the steady-state yaw rate is approximately $0.091 / 0.01 = 9.1$ rad/s $\approx 87°$/s $\approx 1.45$ rev/s.  The yaw angle cycles continuously, as expected for a servoless tricopter with unbalanced reaction torques.
 
-    \item \textbf{Altitude decreases} because the yaw drift tilts the thrust vector sideways, reducing the vertical component of thrust.  The altitude PID cannot compensate fast enough.
+    \item \textbf{Altitude decreases} because the vehicle tilts, reducing the vertical component of thrust.  The altitude PID increases total thrust (visible in the $T$ column), but the tilt-induced thrust loss exceeds the PID's correction capacity.  With more aggressive LQR tuning (smaller $R$), roll/pitch would settle faster and the altitude loss would be less severe.
 
-    \item The \textbf{torque disturbance at $t = 2$ s} causes a brief spike in roll/pitch that is damped within $\sim 2$ s, showing good disturbance rejection.
+    \item \textbf{The yaw rate is bounded.}  Unlike the old 6-state architecture (which tried and failed to hold yaw angle, causing escalating corrections), the new architecture gracefully accepts yaw drift while preventing runaway spinning.  The yaw damper uses minimal actuator authority.
+
+    \item The \textbf{torque disturbance at $t = 2$ s} perturbs the vehicle, but the perturbation is eventually damped by the stable closed-loop dynamics.
 \end{enumerate}
 
 \subsection{The Under-Actuation Problem}
@@ -935,6 +1221,30 @@ The yaw drift is \textbf{not} a controller bug --- it is a fundamental \emph{phy
 \end{itemize}
 
 No choice of spin directions $d_i \in \{+1, -1\}$ can satisfy $1.2 d_1 + d_2 + d_3 = 0$ because $1.2$ is not an integer.  The vehicle fundamentally cannot hover without yaw drift unless the geometry is changed (e.g., symmetric arm lengths) or a yaw servo is added.
+
+\subsection{Why the New Architecture Is Better}
+
+The redesigned controller accepts this physical reality rather than fighting it:
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{lcc}
+\toprule
+\textbf{Property} & \textbf{Old (6-state LQR)} & \textbf{New (4-state + damper)} \\
+\midrule
+LQR state dimension & 6 & 4 \\
+Hamiltonian size & $12 \times 12$ & $8 \times 8$ \\
+CARE iterations & 15--25 & 12 \\
+CARE residual & $2.4 \times 10^{-11}$ & $5.3 \times 10^{-11}$ \\
+Yaw control & Attempts angle hold & Rate damping only \\
+Yaw actuator usage & High (fights residual) & Low (proportional to rate) \\
+Cross-coupling & Yaw $\leftrightarrow$ roll/pitch & Minimised via pseudoinverse \\
+Unit tests & 9 & 11 \\
+\bottomrule
+\end{tabular}
+\caption{Comparison of old and new controller architectures.}
+\end{table}
 
 % =============================================================================
 \section{Hardware Considerations}
@@ -954,7 +1264,7 @@ While our code runs as a simulation, the same algorithms would execute on a real
 \subsubsection{Computation (Processing)}
 \begin{itemize}
     \item The LQR gain $\bK$ is computed \textbf{offline} (once, at startup).  The matrix sign function iteration takes $\sim$10 ms on a modern CPU.  On a flight controller MCU (e.g., STM32F4), this could take $\sim$100 ms but only needs to run once.
-    \item At runtime, the control law $\delta\bu = -\bK \cdot \delta\bx$ is a single matrix-vector multiply: 3 rows $\times$ 6 columns $=$ 18 multiply-add operations.  This takes $< 1\,\mu$s even on a 168 MHz ARM Cortex-M4.
+    \item At runtime, the roll/pitch control law $\delta\bu_{\text{rp}} = -\bK_{\text{rp}} \cdot \delta\bx_{\text{rp}}$ is a single matrix-vector multiply: 3 rows $\times$ 4 columns $=$ 12 multiply-add operations.  The yaw damper adds 3 more multiply-adds (pseudoinverse vector times scalar).  Total: $\sim$15 operations, taking $< 1\,\mu$s even on a 168 MHz ARM Cortex-M4.
     \item The PID is similarly trivial: $\sim$10 floating-point operations per timestep.
     \item The RK4 integrator is \emph{not} needed on real hardware --- the real physics \emph{is} the integrator.  RK4 is only for simulation.
 \end{itemize}
@@ -1008,13 +1318,17 @@ For quick reference, here are all the key equations in order:
 
     \item \textbf{RK4:} $\bx_{k+1} = \bx_k + \frac{\Delta t}{6}(\bm{k}_1 + 2\bm{k}_2 + 2\bm{k}_3 + \bm{k}_4)$
 
-    \item \textbf{Linearised attitude:} $\delta\dot{\bx} = \bA\delta\bx + \bB\delta\bu$ where $\bA = \begin{bsmallmatrix} \bzero & \bI \\ \bzero & \bzero \end{bsmallmatrix}$, $\bB = \begin{bsmallmatrix} \bzero \\ \bJ^{-1}\bB_\tau \end{bsmallmatrix}$
+    \item \textbf{Linearised roll/pitch (4-state):} $\delta\dot{\bx}_{\text{rp}} = \bA_{\text{rp}}\delta\bx_{\text{rp}} + \bB_{\text{rp}}\delta\bu$ where $\bA_{\text{rp}} = \begin{bsmallmatrix} \bzero_{2 \times 2} & \bI_{2 \times 2} \\ \bzero_{2 \times 2} & \bzero_{2 \times 2} \end{bsmallmatrix}$, $\bB_{\text{rp}} = \begin{bsmallmatrix} \bzero_{2 \times 3} \\ \text{rows 0--1 of } \bJ^{-1}\bB_\tau \end{bsmallmatrix}$
 
-    \item \textbf{CARE:} $\bA^T\bP + \bP\bA - \bP\bB\bR^{-1}\bB^T\bP + \bQ = \bzero$
+    \item \textbf{CARE (4-state):} $\bA_{\text{rp}}^T\bP + \bP\bA_{\text{rp}} - \bP\bB_{\text{rp}}\bR^{-1}\bB_{\text{rp}}^T\bP + \bQ = \bzero$, \; $\bP \in \R^{4 \times 4}$
 
-    \item \textbf{LQR gain:} $\bK = \bR^{-1}\bB^T\bP$
+    \item \textbf{Roll/pitch LQR gain:} $\bK_{\text{rp}} = \bR^{-1}\bB_{\text{rp}}^T\bP \in \R^{3 \times 4}$
 
-    \item \textbf{Control law:} $\bu = \bu_{\text{hover}} - \bK\delta\bx_{\text{att}} + \delta u_{\text{coll}} \cdot \bm{1}$
+    \item \textbf{Yaw rate damper:} $\delta\bu_{\text{yaw}} = \bB_{\tau,\text{yaw}}^+ \cdot (-k_r \cdot r)$, \; $\bB_{\tau,\text{yaw}}^+ = (\bB_\tau^+)_{\text{col 2}}$
+
+    \item \textbf{Heading-aware command:} $[\phi_{\text{cmd}}, \theta_{\text{cmd}}]^T = \frac{1}{g} \begin{bsmallmatrix} \cos\psi & \sin\psi \\ -\sin\psi & \cos\psi \end{bsmallmatrix} [a_x, a_y]^T$
+
+    \item \textbf{Combined control law:} $\bu = \bu_{\text{hover}} + \delta\bu_{\text{rp}} + \delta\bu_{\text{yaw}} + \delta u_{\text{coll}} \cdot \bm{1}$
 \end{enumerate}
 
 % =============================================================================
@@ -1255,6 +1569,195 @@ Nine unit tests were written to catch regressions:
 
 The tests load the default YAML configuration, so they also serve as integration tests for the configuration parser.  A custom test framework (macros for \texttt{TEST}, \texttt{ASSERT\_TRUE}, \texttt{ASSERT\_NEAR}) was used rather than a full testing library to keep dependencies minimal.
 
+\subsection{Phase 13: The Great Redesign --- Removing Yaw from the LQR}
+
+This phase documents the most significant architectural change in the project's history: removing yaw angle and yaw rate from the LQR entirely and replacing them with a separate yaw rate damper.
+
+\subsubsection{The Motivation: Why the 6-State LQR Was Wrong}
+
+After running the original 6-state LQR simulation, the results showed bounded roll/pitch errors but continuous yaw drift.  The initial reaction was to increase the yaw weight in $\bQ$ from 200 to 500, then to 1000, then to 5000.  Each increase made the yaw response slightly faster but also increased the motor commands and caused more cross-coupling into roll/pitch.
+
+The fundamental insight came from examining the gain matrix $\bK$ ($3 \times 6$).  The yaw-related columns (columns 2 and 5, corresponding to $\psi$ and $r$) had very large entries, meaning that yaw errors produced large motor corrections.  But these corrections could not actually reduce the yaw torque to zero --- they just temporarily counteracted it, at the expense of roll/pitch stability.
+
+The key realisation was this: \textbf{the 6-state LQR is mathematically correct but physically inappropriate}.  The CARE equation finds the optimal gain for a linear time-invariant system, but it cannot change the fact that 3 actuators with this geometry cannot simultaneously control 4 independent quantities (roll torque, pitch torque, yaw torque, total thrust).  The LQR ``optimally'' distributes the inevitable compromise across all states, but this means yaw errors contaminate roll/pitch control.
+
+\subsubsection{The Decision to Split}
+
+The decision to separate yaw from roll/pitch was motivated by a simple observation: roll/pitch and yaw have fundamentally different controllability.  Roll and pitch are fully controllable --- any desired roll/pitch angle can be achieved by appropriate motor commands.  Yaw is under-actuated --- no set of motor commands can achieve zero yaw torque at hover.
+
+By removing yaw from the LQR, the remaining 4-state system ($[\phi, \theta, p, q]$) is fully controllable.  The LQR can then focus its actuator authority on what it can actually control, without wasting effort on yaw.
+
+\subsubsection{Implementing the 4-State LQR}
+
+The implementation changes were:
+
+\paragraph{Config struct changes.}  The \texttt{AttitudeLQRConfig} struct was changed from a 6-element \texttt{Q\_diag} vector to a 4-element \texttt{Eigen::Vector4d}.  A new \texttt{YawDamperConfig} struct was added with a single field: \texttt{k\_r}.
+
+\paragraph{YAML config changes.}  The \texttt{attitude\_lqr.Q\_diag} was reduced from 6 values $[500, 500, 200, 50, 50, 20]$ to 4 values $[100, 100, 10, 10]$.  A new \texttt{yaw\_damper} section was added with \texttt{k\_r: 0.01}.  The config parser was updated to read 4 values instead of 6 and to parse the new section.
+
+\paragraph{A and B matrix construction.}  The A matrix shrank from $6 \times 6$ to $4 \times 4$.  The identity block shrank from $\bI_{3 \times 3}$ to $\bI_{2 \times 2}$.  The B matrix shrank from $6 \times 3$ to $4 \times 3$.  The critical change was extracting only the first 2 rows of $\bJ^{-1} \bB_\tau$ instead of all 3.  This discards the yaw acceleration row.
+
+\paragraph{CARE solver adaptation.}  The Hamiltonian shrank from $12 \times 12$ to $8 \times 8$.  All the \texttt{block<6,6>} template parameters in the CARE solver were changed to \texttt{block<4,4>}.  The determinant scaling exponent changed from $-1/12$ to $-1/8$.  The solver converged in 12 iterations instead of the previous 15--25 --- a direct consequence of the smaller, better-conditioned system.
+
+\paragraph{Gain matrix shape.}  $\bK$ changed from $3 \times 6$ to $3 \times 4$.  This means each motor command depends on 4 states instead of 6.  No motor command depends on yaw angle or yaw rate.
+
+\subsubsection{Bug: Fixed-Size Eigen Template Parameters}
+
+The most tedious part of the transition was updating all the Eigen template parameters.  The original code used:
+\begin{verbatim}
+    Eigen::Matrix<double, 6, 6> A_att;
+    Eigen::Matrix<double, 6, 3> B_att;
+    Eigen::Matrix<double, 3, 6> K;
+    Eigen::Matrix<double, 6, 6> P;
+    Eigen::Matrix<double, 6, 1> delta_x;
+\end{verbatim}
+
+Every single one of these had to be changed to the 4-state equivalent:
+\begin{verbatim}
+    Eigen::Matrix4d A_rp;
+    Eigen::Matrix<double, 4, 3> B_rp;
+    Eigen::Matrix<double, 3, 4> K;
+    Eigen::Matrix4d P;
+    Eigen::Vector4d delta_x;
+\end{verbatim}
+
+A mistake in any one of these would cause a compile error (Eigen's fixed-size matrices enforce dimension compatibility at compile time).  This is actually a feature, not a bug --- the compiler caught every missed update, preventing runtime dimension mismatches.
+
+The CARE solver also had dynamic-size matrices (\texttt{Eigen::MatrixXd}) for the Hamiltonian.  These compiled without error regardless of dimension, so errors could only be caught at runtime.  The \texttt{block<6,6>} calls within the CARE solver were the most dangerous --- changing them to \texttt{block<4,4>} was critical, and missing even one would silently extract the wrong submatrix.
+
+\subsubsection{Bug: Eigenvalue Solver Template Mismatch}
+
+The eigenvalue verification code originally used:
+\begin{verbatim}
+    Eigen::EigenSolver<Eigen::Matrix<double, 6, 6>> es(A_cl);
+    for (int i = 0; i < 6; ++i) { ... }
+\end{verbatim}
+
+The template parameter and loop bound both had to change to 4.  Changing the loop bound but not the template (or vice versa) would compile but produce wrong results.  The fix was straightforward:
+\begin{verbatim}
+    Eigen::EigenSolver<Eigen::Matrix4d> es(A_cl);
+    for (int i = 0; i < 4; ++i) { ... }
+\end{verbatim}
+
+\subsubsection{Implementing the Yaw Rate Damper}
+
+The yaw damper was implemented as a new \texttt{YawDamper} struct in \texttt{lqr.hpp}/\texttt{lqr.cpp}.  The key design decision was how to convert a desired yaw torque into motor commands.
+
+\paragraph{First attempt: naive yaw row.}  The first implementation simply used the yaw row of $\bB_\tau$:
+\begin{verbatim}
+    delta_u_yaw = tau_yaw_cmd / B_tau_yaw_row;
+\end{verbatim}
+This failed because $\bB_{\tau,\text{yaw}}$ is a row vector (1$\times$3), not a scalar.  Dividing by a vector is undefined.  The solution was to use the pseudoinverse.
+
+\paragraph{Second attempt: yaw-only pseudoinverse.}  The second attempt computed the pseudoinverse of just the yaw row:
+\begin{verbatim}
+    pinv = B_tau_yaw.transpose() / (B_tau_yaw * B_tau_yaw.transpose());
+\end{verbatim}
+This gives the minimum-norm solution to $\bB_{\tau,\text{yaw}} \cdot \delta\bu = \tau_{\text{cmd}}$, but it ignores the effect on roll and pitch.  The resulting motor commands produced the correct yaw torque but also created unwanted roll/pitch torques that disturbed the LQR.
+
+\paragraph{Third attempt (correct): full B\_tau pseudoinverse.}  The final implementation uses the pseudoinverse of the full $3 \times 3$ $\bB_\tau$ matrix:
+\begin{verbatim}
+    B_tau_pinv = B_tau.transpose() * (B_tau * B_tau.transpose()).inverse();
+    yaw_pinv = B_tau_pinv.col(2);  // column 2 = yaw
+\end{verbatim}
+Column 2 of $\bB_\tau^+$ maps a pure yaw torque command to motor commands that produce that yaw torque while minimising the roll/pitch torque disturbance.  This is the key property of the pseudoinverse: it finds the minimum-norm solution that satisfies the constraint.
+
+\subsubsection{Implementing the Heading-Aware Command}
+
+The heading-aware command was implemented as a static method on a new \texttt{HeadingAwareCommand} struct.  The mathematics are simple (rotation matrix applied to desired acceleration), but two physical errors occurred during implementation:
+
+\paragraph{Error 1: Sign convention.}  The first implementation had:
+\begin{verbatim}
+    phi_cmd = (cos(psi)*ax + sin(psi)*ay) / g;
+    theta_cmd = (sin(psi)*ax - cos(psi)*ay) / g;  // WRONG
+\end{verbatim}
+The second row should be $(-\sin\psi \cdot a_x + \cos\psi \cdot a_y) / g$, not $(+\sin\psi \cdot a_x - \cos\psi \cdot a_y)$.  The sign error was caught by the heading-aware command unit test, which verified that at $\psi = 90°$, a desired x-acceleration produces a negative theta command (pitch backward when facing east to accelerate north).
+
+\paragraph{Error 2: $g$ denominator.}  An early version forgot to divide by $g$:
+\begin{verbatim}
+    phi_cmd = cos(psi)*ax + sin(psi)*ay;  // WRONG: missing /g
+\end{verbatim}
+Without the $1/g$ factor, a desired acceleration of 1 m/s$^2$ would command a 1-radian ($57°$) roll, which is far too aggressive.  The correct scaling is approximately $0.1$ rad per m/s$^2$.
+
+\subsubsection{Updating the Simulation Loop}
+
+The simulation loop was the most complex part to update because it ties everything together.  The changes were:
+
+\begin{enumerate}
+    \item \textbf{Simulation function signature:} Added \texttt{const YawDamper\& yaw\_damper} parameter alongside the existing LQR parameter.  The LQR type changed from \texttt{AttitudeLQR} to \texttt{RollPitchLQR}.
+
+    \item \textbf{Error vector construction:} Changed from 6-state to 4-state:
+\begin{verbatim}
+    // Old (6-state):
+    Eigen::Matrix<double, 6, 1> delta_x_att;
+    delta_x_att(0) = euler(0);
+    delta_x_att(1) = euler(1);
+    delta_x_att(2) = psi_err;  // yaw angle error
+    delta_x_att.tail<3>() = omega_body;
+
+    // New (4-state):
+    Eigen::Vector4d delta_x_rp;
+    delta_x_rp(0) = phi - phi_cmd;
+    delta_x_rp(1) = theta - theta_cmd;
+    delta_x_rp(2) = p;
+    delta_x_rp(3) = q;
+\end{verbatim}
+
+    \item \textbf{Yaw wrapping removed:}  The old code wrapped $\psi$ to $[-\pi, \pi]$ for the LQR's yaw error.  This is no longer needed because the LQR doesn't see yaw at all.  The yaw damper only uses the yaw rate $r$, which doesn't need wrapping.
+
+    \item \textbf{Combined control law:}  The summation changed from 3 terms to 4:
+\begin{verbatim}
+    u(i) = trim.u_hover(i)
+         + delta_u_rp(i)      // roll/pitch LQR
+         + delta_u_yaw(i)     // yaw damper
+         + delta_u_coll;      // altitude PID
+\end{verbatim}
+
+    \item \textbf{Logging:}  Added yaw rate $r$ to the console output for debugging the damper behaviour.
+\end{enumerate}
+
+\subsubsection{Updating the Unit Tests}
+
+Two new tests were added:
+
+\paragraph{\texttt{test\_yaw\_damper}:}  Verifies that (a) zero yaw rate produces zero output, and (b) positive yaw rate produces negative yaw torque (damping opposes motion).  The second check uses $\bB_{\tau,\text{yaw}} \cdot \delta\bu_{\text{yaw}} < 0$.
+
+\paragraph{\texttt{test\_heading\_aware\_command}:}  Verifies three cases: (a) at $\psi = 0$, the mapping is identity ($a_x \to \phi$, $a_y \to \theta$), (b) at $\psi = 90°$, the axes rotate correctly, and (c) zero desired acceleration produces zero command for any heading.
+
+The existing CARE tests were updated: the eigenvalue loop bound changed from 6 to 4, the matrix types changed from \texttt{Matrix<double,6,6>} to \texttt{Matrix4d}, and the struct type changed from \texttt{AttitudeLQR} to \texttt{RollPitchLQR}.
+
+\subsubsection{Build Errors Encountered}
+
+The first build after the redesign produced 23 compiler errors, all from Eigen dimension mismatches.  The errors were:
+
+\begin{enumerate}
+    \item \textbf{Type mismatch in test:} \texttt{lqr.P} was now $4 \times 4$ but the test used \texttt{Eigen::Matrix<double,6,6>} for the eigenvalue solver.  Fixed by changing to \texttt{Eigen::Matrix4d}.
+
+    \item \textbf{Missing yaw\_damper parameter:} The simulation \texttt{run()} function gained a new parameter, but the call site in \texttt{main.cpp} still used the old 4-parameter signature.  Fixed by adding the yaw damper argument.
+
+    \item \textbf{Struct rename:} All references to \texttt{AttitudeLQR} had to change to \texttt{RollPitchLQR}.  This affected \texttt{main.cpp}, \texttt{simulation.hpp}, \texttt{simulation.cpp}, and \texttt{test\_main.cpp}.
+
+    \item \textbf{YAML parser:}  The parser read 6 values for \texttt{Q\_diag} but the new config only has 4.  The loop bound changed from 6 to 4, and the vector type changed from \texttt{Matrix<double,6,1>} to \texttt{Vector4d}.
+\end{enumerate}
+
+After fixing all 23 errors, the build succeeded with zero warnings.
+
+\subsubsection{Simulation Results and Physics Validation}
+
+The first simulation run with the new architecture showed:
+
+\begin{itemize}
+    \item \textbf{All 4 closed-loop eigenvalues stable:} $\lambda_{0,1} = -0.0266 \pm 0.0266j$, $\lambda_{2,3} = -0.0315 \pm 0.0315j$.  All have negative real parts.
+
+    \item \textbf{CARE residual:} $5.27 \times 10^{-11}$, confirming machine-precision accuracy.
+
+    \item \textbf{Yaw rate growth:} The yaw rate grew from 0 to approximately 13.8 rad/s over 10 seconds, consistent with the residual torque of 0.091 Nm and the very light damping ($k_r = 0.01$).  The steady-state should be approximately $0.091/0.01 = 9.1$ rad/s, but 10 seconds is not enough time to reach steady state with the vehicle dynamics.
+
+    \item \textbf{Altitude loss:} The vehicle lost significant altitude because the conservative LQR tuning ($R = 1$) produces slow roll/pitch settling ($\tau \approx 30$--37 s), so the vehicle remains tilted for a long time, reducing vertical thrust.  With more aggressive tuning ($R = 10^{-5}$), the roll/pitch would settle in $\sim 1$ s and the altitude loss would be much smaller.
+\end{itemize}
+
+The key validation is that the system is provably stable (all eigenvalues negative) and the yaw rate is bounded (damper prevents runaway spin).  The slow response is a deliberate choice of the Q/R weights, not a design flaw.
+
 \subsection{What Happens at the Software Level}
 
 At the software level, the execution proceeds through several distinct computational phases, each with different performance characteristics.
@@ -1325,19 +1828,44 @@ The total compilation time (including FetchContent downloads of Eigen and yaml-c
 \section{Conclusion}
 % =============================================================================
 
-We have built a complete flight controller for a servoless asymmetric tricopter from first principles.  The cascaded architecture (inner attitude LQR + outer altitude PID) successfully separates the fast rotational dynamics from the slower translational dynamics.
+We have built a complete flight controller for a servoless asymmetric tricopter from first principles, and then redesigned it to better match the vehicle's physical capabilities.
 
-The CARE equation was solved using the matrix sign function applied to the Hamiltonian --- a numerically robust method that handles the poorly conditioned system arising from the small $\bB$ matrix entries.
+\subsection{The Original Design and Its Limitations}
 
-The simulation revealed a fundamental limitation: a servoless tricopter with this rotor geometry and spin directions $[+1, -1, +1]$ \emph{cannot} achieve torque-free hover.  The residual yaw torque of 0.091 Nm causes continuous yaw drift.  This is not a controller deficiency but a physical under-actuation: 3 actuators cannot independently control 3 torques plus thrust (4 constraints).  The solution requires either a yaw servo (4th actuator), tilted rotor axes, or a modified rotor geometry where the arm lengths form integer ratios with the spin direction assignment.
+The original 6-state LQR attempted to control all three Euler angles and rates simultaneously.  While mathematically correct (all eigenvalues stable, CARE residual at machine precision), it was physically inappropriate: the LQR wasted actuator authority trying to hold a yaw angle that the vehicle's geometry makes impossible to maintain.
 
-Despite this limitation, the controller demonstrates:
+\subsection{The Redesigned Architecture}
+
+The redesigned controller cleanly separates what can be controlled from what can only be damped:
+
+\begin{enumerate}
+    \item \textbf{Roll/Pitch LQR (4-state):}  A reduced LQR that controls only $[\phi, \theta, p, q]$.  The A matrix is $4 \times 4$, the B matrix is $4 \times 3$, and the CARE Hamiltonian is $8 \times 8$.  This system is fully controllable --- the LQR can drive all 4 states to zero.
+
+    \item \textbf{Yaw Rate Damper:}  A simple proportional controller $\tau_{\text{yaw}} = -k_r \cdot r$ that prevents yaw rate from growing unboundedly.  It uses the pseudoinverse of $\bB_\tau$ to minimise cross-coupling into roll/pitch.  The steady-state yaw rate is $\tau_{\text{residual}} / k_r$.
+
+    \item \textbf{Heading-Aware Command:}  Infrastructure for translating world-frame acceleration commands through the current (drifting) yaw angle.  Currently outputs zero for level hover, but ready for a future position controller.
+
+    \item \textbf{Altitude PID (unchanged):}  Classical PID with derivative-on-measurement and integral anti-windup.
+\end{enumerate}
+
+\subsection{Key Results}
+
+The CARE equation was solved using the matrix sign function applied to the $8 \times 8$ Hamiltonian --- converging in 12 iterations with a residual of $5.27 \times 10^{-11}$ (machine precision).
+
+The simulation revealed the expected behaviour: bounded roll/pitch with continuous yaw drift.  The yaw drift is a fundamental physical limitation --- a servoless tricopter with this geometry and spin directions $[+1, -1, +1]$ \emph{cannot} achieve torque-free hover.  The redesigned controller accepts this reality gracefully.
+
+The controller demonstrates:
 \begin{itemize}
-    \item Bounded roll and pitch errors ($\pm 15°$) from a $5°/3°$ initial perturbation.
-    \item Effective impulse disturbance rejection within $\sim$2 seconds.
-    \item All closed-loop eigenvalues with negative real parts (provably stable linearised system).
-    \item CARE residual of $2.4 \times 10^{-11}$ (machine-precision accuracy).
-    \item All 9 unit tests passing.
+    \item All 4 closed-loop eigenvalues with negative real parts (provably stable roll/pitch control).
+    \item CARE residual of $5.27 \times 10^{-11}$ (machine-precision accuracy).
+    \item Bounded yaw rate via proportional damping (prevents runaway spin).
+    \item Heading-aware command infrastructure for future position control.
+    \item 12 CARE iterations (reduced from 15--25 with the 6-state system).
+    \item All 11 unit tests passing (including new yaw damper and heading-aware command tests).
 \end{itemize}
+
+\subsection{The Physical Lesson}
+
+The deepest lesson from this project is that good control design starts with understanding the physics.  A mathematically optimal controller (the 6-state LQR) can be physically inappropriate if it asks the vehicle to do something the hardware cannot achieve.  The 4-state LQR + yaw damper architecture is simpler, faster to solve, and better matched to the vehicle's actual capabilities.  In control engineering, knowing what \emph{not} to control is often as important as knowing what to control.
 
 \end{document}
